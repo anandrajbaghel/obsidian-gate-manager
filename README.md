@@ -21,7 +21,10 @@ Welcome to GATE Manager! This Obsidian plugin acts as a bridge between your pers
 - **🔔 Built-in Release Notes:** Read what’s new in the latest study pack right from your Obsidian dashboard.
 - more to follow
 
----
+## Compatibility
+
+- Desktop: ✅ Supported
+- Mobile: ❌ Not supported
 
 ## 📥 How to Install
 
@@ -56,6 +59,34 @@ Welcome to GATE Manager! This Obsidian plugin acts as a bridge between your pers
 ## 🙋‍♂️ Frequently Asked Questions
 
 ...will update later
+
+---
+
+## 🔒 Privacy & Network Requests
+
+GATE Manager only connects to external services when initiated by the user.
+
+### GitHub
+- api.github.com
+- github.com
+
+Used to:
+- Check for available releases
+- Download repository releases
+- Display release information
+
+### Community
+- aratt.ai
+- chat.arattai.in
+
+These links are opened only when the user chooses to access the community.
+
+### Support
+- razorpay.me
+
+Opened only when the user chooses to support the project.
+
+GATE Manager does not automatically upload your vault contents or personal notes to any external service.
 
 ---
 
