@@ -1,9 +1,9 @@
 {
 	"id": "gate-manager",
 	"name": "GATE Manager",
-	"version": "1.0.0",
-	"minAppVersion": "1.0.0",
-	"description": "Community-managed installer and updater for GATE Obsidian vaults.",
+	"version": "1.0.1",
+	"minAppVersion": "1.8.0",
+	"description": "Install and update community-maintained GATE Vault repositories.",
 	"author": "Anand Baghel",
 	"authorUrl": "https://github.com/anandrajbaghel",
 	"isDesktopOnly": true
