@@ -4,6 +4,9 @@
 
 GATE Manager connects your personal vault with a community-maintained GATE repository. It downloads and installs repository updates while allowing you to review every change before it is applied.
 
+<p align="left"> <a href="https://razorpay.me/@anandbaghel"> <img src="https://img.shields.io/badge/Support%20GATE%20Vault-d97706?style=for-the-badge&logo=github&logoColor=white" alt="Support Development"> </a> </p>
+
+
 ## ✨ What GATE Manager Does
 
 - Download GATE Vault releases directly from GitHub.
@@ -67,8 +70,8 @@ These requests are used to:
 
 The following links are opened only when you choose to access them:
 
-- `aratt.ai`
-- `chat.arattai.in`
+- `telegram.com`
+- `youtube.com`
 
 ### Support
 
@@ -122,8 +125,7 @@ This project is licensed under the MIT License.
 
 Studying for GATE is a journey, and you don't have to do it alone!
 
-- 📢 **Broadcast Channel:** [Join our Arattai Channel](https://aratt.ai/@gate)
-- 💬 **Community Chat:** Available for supporters [here](https://chat.arattai.in/groups/r43545f313436363135373638323731353339343239325f333333363938382d47437c3031303032313133333230353137383335393037363537363530).
+- 📢 **Join Telegram Channel:** [Join our Telegram Channel](https://t.me/gate_ee0)
 - ☕ **Support the Creator:** If this tool saves you time and helps your studies, consider [supporting the development here](https://razorpay.me/@anandbaghel).
 
 *Happy Studying!* 🚀
