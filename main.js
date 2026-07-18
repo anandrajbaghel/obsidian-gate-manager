@@ -1,16 +1,131 @@
+// ==========================================
+// DEVELOPER CONFIGURATION
+// ==========================================
+// Set to true to enable the hidden Developer Options in the Settings tab 
+// (allows downloading specific past versions for testing).
+const DEV_MODE = false;
+// ==========================================
 
-// --- START OF FILE main.js ---
-
-const { Plugin, PluginSettingTab, Setting, Notice, Modal, MarkdownRenderer, ItemView, WorkspaceLeaf } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, Notice, Modal, MarkdownRenderer, ItemView, WorkspaceLeaf, ToggleComponent, TFile } = require('obsidian');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const https = require('https');
-const http = require('http');
+// Note: the plain `http` module is intentionally NOT required — DownloadManager is
+// https-only (see assertSafeDownloadUrl below) and has no legitimate use for it.
 const { URL } = require('url');
 const crypto = require('crypto');
 
 const VIEW_TYPE_GATE_MANAGER = "gate-manager-view";
+
+// Safe path-boundary check: is `child` inside (or equal to) `parent`?
+// A plain `child.startsWith(path.resolve(parent))` is NOT safe — e.g. parent
+// "/tmp/gate-extract" is a string-prefix of the sibling directory
+// "/tmp/gate-extract-evil", so a crafted archive entry name could resolve to a path
+// outside the intended directory while still passing that check. Using path.relative()
+// and rejecting any result that starts with ".." (or is absolute, on Windows drive-swap
+// cases) closes that gap.
+function isPathInside(child, parent) {
+	const resolvedParent = path.resolve(parent);
+	const resolvedChild = path.resolve(child);
+	if (resolvedChild === resolvedParent) return true;
+	const relative = path.relative(resolvedParent, resolvedChild);
+	return !!relative && relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+}
+
+// Hosts the DownloadManager is allowed to connect to — both for the initial download URL
+// and for every hop of a redirect chain. This plugin downloads and extracts arbitrary
+// content into the user's vault, so it deliberately does NOT follow redirects to whatever
+// host a server-controlled `Location` header happens to point to; only GitHub's own
+// asset-serving infrastructure is trusted. If GitHub changes its release-asset CDN hostnames
+// in the future, downloads will start failing closed with a clear "untrusted host" error
+// rather than silently fetching from somewhere else — update this list if that happens.
+const TRUSTED_DOWNLOAD_HOSTS_EXACT = new Set([
+	'github.com',
+	'api.github.com',
+	'codeload.github.com',
+	'raw.githubusercontent.com'
+]);
+const TRUSTED_DOWNLOAD_HOST_SUFFIX = '.githubusercontent.com'; // covers objects./release-assets./github-cloud.githubusercontent.com etc.
+
+function isTrustedDownloadHost(hostname) {
+	if (!hostname) return false;
+	const host = hostname.toLowerCase();
+	return TRUSTED_DOWNLOAD_HOSTS_EXACT.has(host) || host.endsWith(TRUSTED_DOWNLOAD_HOST_SUFFIX);
+}
+
+// Fail-closed validation used both for the initial download URL and for every redirect hop.
+// Throws (rather than returning a boolean) so callers can't accidentally ignore the result.
+function assertSafeDownloadUrl(urlString) {
+	let parsed;
+	try {
+		parsed = new URL(urlString);
+	} catch (e) {
+		throw new Error(`Blocked download: malformed URL.`);
+	}
+	if (parsed.protocol !== 'https:') {
+		throw new Error(`Blocked insecure download: only https:// URLs are allowed (got ${parsed.protocol})`);
+	}
+	if (!isTrustedDownloadHost(parsed.hostname)) {
+		throw new Error(`Blocked download: untrusted host "${parsed.hostname}". Only official GitHub hosts are allowed.`);
+	}
+	return parsed;
+}
+
+// --- Secret storage for the GitHub token ------------------------------------------------
+// Obsidian's plugin data file (data.json) is plain, unencrypted JSON on disk. Where the
+// platform supports it, we additionally encrypt the token at rest using Electron's
+// OS-level `safeStorage` API — Keychain on macOS, DPAPI on Windows, libsecret/kwallet on
+// Linux (the same mechanism most Electron desktop apps use for storing secrets). This is
+// best-effort and NOT guaranteed available on every platform/build (e.g. some Linux
+// desktops have no secret-storage backend installed at all), so it always falls back to
+// plain-text storage rather than losing the token — and the settings UI tells the user
+// plainly which mode is actually active, so nothing is silently "more secure" than it is.
+const TokenCrypto = {
+	_safeStorage: null,
+	_checked: false,
+	_getSafeStorage() {
+		if (this._checked) return this._safeStorage;
+		this._checked = true;
+		try {
+			const electron = require('electron');
+			if (electron && electron.safeStorage && typeof electron.safeStorage.isEncryptionAvailable === 'function' && electron.safeStorage.isEncryptionAvailable()) {
+				this._safeStorage = electron.safeStorage;
+			}
+		} catch (e) {
+			this._safeStorage = null; // 'electron' not requirable, or safeStorage missing on this build/platform
+		}
+		return this._safeStorage;
+	},
+	isAvailable() {
+		return !!this._getSafeStorage();
+	},
+	// Returns a marker-prefixed, base64-encoded ciphertext, or null if encryption isn't
+	// available (caller should fall back to plain-text storage in that case).
+	encrypt(plainText) {
+		const ss = this._getSafeStorage();
+		if (!ss || !plainText) return null;
+		try {
+			return 'v1:' + ss.encryptString(plainText).toString('base64');
+		} catch (e) {
+			console.error('[GATE Manager] Token encryption failed, falling back to plain text storage:', e);
+			return null;
+		}
+	},
+	// Returns the decrypted string, or null if it can't be decrypted (moved to a different
+	// machine/OS user account, corrupted, or encryption unavailable on this platform).
+	decrypt(stored) {
+		if (!stored || typeof stored !== 'string' || !stored.startsWith('v1:')) return null;
+		const ss = this._getSafeStorage();
+		if (!ss) return null;
+		try {
+			return ss.decryptString(Buffer.from(stored.slice(3), 'base64'));
+		} catch (e) {
+			console.error('[GATE Manager] Token decryption failed (moved to a different machine/user account?):', e);
+			return null;
+		}
+	}
+};
 
 // Define the default configuration for the plugin.
 const DEFAULT_SETTINGS = {
@@ -21,7 +136,22 @@ const DEFAULT_SETTINGS = {
 	enableNotifications: true,
 	releaseChannel: "stable",
 	hasCompletedOnboarding: false,
-	exclusionFilter: ".obsidian/app.json, tools, .gitattributes, CODE_OF_CONDUCT.md, CONTRIBUTING.md, INDEX_SPEC.md, INSTALL_PLAN_SPEC.md, README.md, SPEC.md, UPDATE_POLICY.md, VAULT_RULES_SPEC.md, VAULT_SPEC.md, vault-index.json, vault-manifest.json, vault-rules.json"
+	exclusionFilter: ".obsidian, scripts, tools, .gitattributes, CODE_OF_CONDUCT.md, CONTRIBUTING.md, INDEX_GENERATOR_SPEC.md, INDEX_SPEC.md, INSTALL_PLAN_SPEC.md, LICENSE, README.md, SPEC.md, UPDATE_POLICY.md, VAULT_RULES_SPEC.md, VAULT_SPEC.md, vault-index.json, vault-manifest.json, vault-rules.json",
+	autoOpenChangelog: true,
+	devTargetVersion: "",
+	lastUpdateCheckTime: 0, // For rate limiting API checks (applies to ALL check types now)
+	githubToken: "", // Optional GitHub Personal Access Token, held in memory at runtime.
+	                  // Raises the API rate limit from 60 req/hr (shared per network IP) to
+	                  // 5,000 req/hr (per-token), and is required for automatic background
+	                  // update checks (see checkForUpdates). NOT written to disk in plain
+	                  // text when OS-level encryption is available — see githubTokenEncrypted
+	                  // and TokenCrypto above / _settingsForDisk() below.
+	githubTokenEncrypted: "" // The token as actually persisted to data.json when TokenCrypto
+	                          // encryption is available on this platform (see saveSettings /
+	                          // _persistSettings / loadSettings). Empty when encryption isn't
+	                          // available, in which case githubToken itself is written in
+	                          // plain text instead (Obsidian's data.json has no built-in
+	                          // encryption either way).
 };
 
 /**
@@ -102,6 +232,8 @@ class Action {
 		this.warnings = config.warnings || [];
 		this.errors = config.errors || [];
 		
+		this.isMandatory = config.isMandatory || false;
+
 		if (config.source) this.source = config.source;
 		if (config.destination) this.destination = config.destination;
 		if (config.repositoryHash) this.repositoryHash = config.repositoryHash;
@@ -163,7 +295,8 @@ class RuleEngine {
 	_getMatchingRule(relativePath) {
 		let match = null;
 		for (const rule of this.ruleList) {
-			if (rule.path && relativePath.startsWith(rule.path)) {
+			// Fix: Implement proper path-segment matching to avoid false positives (e.g. "Resources Backup" matching "Resources")
+			if (rule.path && (relativePath === rule.path || relativePath.startsWith(rule.path + '/'))) {
 				if (!match || rule.path.length > match.path.length) {
 					match = rule;
 				}
@@ -205,7 +338,7 @@ class InstallationPlanner {
 		this.state = 'planning';
 		
 		console.log("[Planner] Planning started.");
-		this.plugin.statusBarItemEl.setText("GATE: Planning Installation...");
+		this.plugin.statusBarItemEl.setText("⏳ GATE: Planning Installation...");
 		this.plugin.notifyUI();
 
 		const startTime = Date.now();
@@ -226,7 +359,8 @@ class InstallationPlanner {
 				for (const f of repoModel.index.files) {
 					const p = typeof f === 'object' ? f.path : f;
 					const h = typeof f === 'object' ? f.hash : null;
-					repoMap.set(p, { path: p, hash: h });
+					const s = typeof f === 'object' ? (f.size || 0) : 0; // Grab size for stats
+					repoMap.set(p, { path: p, hash: h, size: s });
 				}
 			} else {
 				const archiveRoot = this.plugin.extractionManager.result.archiveRoot;
@@ -236,15 +370,22 @@ class InstallationPlanner {
 						const relDir = queue.shift();
 						const absDir = path.join(archiveRoot, relDir);
 						try {
-							const items = fs.readdirSync(absDir, { withFileTypes: true });
+							const items = await fs.promises.readdir(absDir, { withFileTypes: true });
 							for (const item of items) {
+								if (item.isSymbolicLink()) continue; // Fix: avoid symlink infinite loops
 								const itemRelPath = relDir ? `${relDir}/${item.name}` : item.name;
 								if (item.name === '.git') continue; 
 								
 								if (item.isDirectory()) {
 									queue.push(itemRelPath);
 								} else if (item.isFile()) {
-									repoMap.set(itemRelPath, { path: itemRelPath, hash: null }); 
+									// Extract file size for accurate generic-mode statistics
+									let size = 0;
+									try {
+										const stat = await fs.promises.stat(path.join(absDir, item.name));
+										size = stat.size;
+									} catch(e) {}
+									repoMap.set(itemRelPath, { path: itemRelPath, hash: null, size }); 
 								}
 							}
 						} catch(err) {
@@ -266,23 +407,32 @@ class InstallationPlanner {
 				}
 			}
 
+			const changelogFile = repoModel.manifest.changelog || null;
+
 			for (const [relativePath, repoEntry] of repoMap.entries()) {
 				const localEntry = localMap.get(relativePath);
 				const stateEntry = stateMap.get(relativePath);
 				const ownership = ruleEngine.getOwnership(relativePath);
 
 				let type, priority, reason, extras = {};
+				
+				const isMandatory = (changelogFile && relativePath === changelogFile);
 
-				if (!localEntry || !localEntry.exists) {
+				// Security mechanism to block the plugin from overwriting its own files
+				if (relativePath.startsWith('.obsidian/plugins/gate-manager/')) {
+					type = ActionType.IGNORE;
+					priority = ActionPriority.IGNORE;
+					reason = "Plugin self-protection. Will not overwrite.";
+				} else if (!localEntry || !localEntry.exists) {
 					type = ActionType.INSTALL;
 					priority = ActionPriority.INSTALL;
 					reason = "New file from repository.";
 					extras = { source: relativePath, destination: relativePath, repositoryHash: repoEntry.hash };
-				} else if (ownership === 'User') {
+				} else if (ownership === 'User' && !isMandatory) {
 					type = ActionType.IGNORE;
 					priority = ActionPriority.IGNORE;
 					reason = "User-owned content.";
-				} else if (ownership === 'Shared') {
+				} else if (ownership === 'Shared' && !isMandatory) {
 					type = ActionType.MERGE;
 					priority = ActionPriority.MERGE;
 					reason = "Shared ownership.";
@@ -301,34 +451,67 @@ class InstallationPlanner {
 					const repoHash = repoEntry.hash;
 					const installedHash = stateEntry ? stateEntry.installedHash : null;
 
+					// FIX: Deterministic and safe hash comparisons, correcting first-install & generic mode ambiguity
 					if (repoHash === null) {
-						type = ActionType.UPDATE;
-						priority = ActionPriority.UPDATE;
-						reason = "File exists locally (overwrite).";
-						extras = { destination: relativePath };
-					} else if (repoHash === installedHash && installedHash === currentHash) {
+						// Generic Mode: No repo hash available. Safely skip to prevent overwriting user modifications.
 						type = ActionType.SKIP;
 						priority = ActionPriority.SKIP;
-						reason = "Repository unchanged.";
-					} else if (repoHash !== installedHash && installedHash === currentHash) {
-						type = ActionType.UPDATE;
-						priority = ActionPriority.UPDATE;
-						reason = "Repository updated.";
-						extras = { oldHash: installedHash, newHash: repoHash, destination: relativePath };
-					} else if (repoHash !== installedHash && installedHash !== currentHash) {
-						type = ActionType.CONFLICT;
-						priority = ActionPriority.CONFLICT;
-						reason = "Local file modified and repository updated.";
-						extras = { repositoryHash: repoHash, installedHash: installedHash, currentHash: currentHash, resolution: 'UNRESOLVED' };
-					} else if (repoHash === installedHash && installedHash !== currentHash) {
-						type = ActionType.SKIP;
-						priority = ActionPriority.SKIP;
-						reason = "Local file modified but repository unchanged.";
+						reason = "File exists locally but repository lacks hash (Generic Mode). Safely skipping.";
+					} else if (installedHash === null) {
+						// Unknown State / Pre-existing file before plugin managed it
+						if (currentHash === repoHash) {
+							type = ActionType.SKIP;
+							priority = ActionPriority.SKIP;
+							reason = "Existing file matches repository exactly.";
+						} else {
+							type = ActionType.CONFLICT;
+							priority = ActionPriority.CONFLICT;
+							reason = "Pre-existing file differs from repository (Unknown origin).";
+							extras = { repositoryHash: repoHash, currentHash: currentHash, resolution: 'UNRESOLVED' };
+						}
 					} else {
-						type = ActionType.SKIP;
-						priority = ActionPriority.SKIP;
-						reason = "Unhandled hash state, skipping safely.";
+						// Known State: Plugin has historically managed this file
+						if (currentHash === installedHash) {
+							// User has not modified the file
+							if (repoHash === installedHash) {
+								type = ActionType.SKIP;
+								priority = ActionPriority.SKIP;
+								reason = "Repository unchanged.";
+							} else {
+								type = ActionType.UPDATE;
+								priority = ActionPriority.UPDATE;
+								reason = "Repository updated.";
+								extras = { oldHash: installedHash, newHash: repoHash, destination: relativePath };
+							}
+						} else {
+							// User HAS modified the file
+							if (repoHash === installedHash) {
+								type = ActionType.SKIP;
+								priority = ActionPriority.SKIP;
+								reason = "Local file modified but repository unchanged. Preserving local edits.";
+							} else {
+								// Repository updated AND user modified
+								if (currentHash === repoHash) {
+									type = ActionType.SKIP;
+									priority = ActionPriority.SKIP;
+									reason = "Local file manually updated to exact new repository state.";
+								} else {
+									type = ActionType.CONFLICT;
+									priority = ActionPriority.CONFLICT;
+									reason = "Local file modified and repository updated.";
+									extras = { repositoryHash: repoHash, installedHash: installedHash, currentHash: currentHash, resolution: 'UNRESOLVED' };
+								}
+							}
+						}
 					}
+				}
+
+				// Safety enforcement: If it's the changelog (or mandatory) and missing, force install.
+				// However, if there's a CONFLICT, it remains a CONFLICT instead of blindly bypassing safety rules.
+				if (isMandatory && type === ActionType.SKIP && (!localEntry || !localEntry.exists)) {
+					type = ActionType.INSTALL;
+					priority = ActionPriority.INSTALL;
+					reason = "Mandatory file missing. Installing.";
 				}
 
 				unsortedActions.push(new Action({
@@ -336,9 +519,11 @@ class InstallationPlanner {
 					path: relativePath,
 					priority,
 					reason,
+					isMandatory,
 					repositoryEntry: repoEntry,
 					localEntry,
 					stateEntry,
+					estimatedBytes: repoEntry.size || 0,
 					...extras
 				}));
 			}
@@ -346,7 +531,7 @@ class InstallationPlanner {
 			for (const [relativePath, stateEntry] of stateMap.entries()) {
 				if (!repoMap.has(relativePath)) {
 					const localEntry = localMap.get(relativePath);
-					if (localEntry && localEntry.exists) {
+					if (localEntry && localEntry.exists && !relativePath.startsWith('.obsidian/plugins/gate-manager/')) {
 						unsortedActions.push(new Action({
 							type: ActionType.ARCHIVE,
 							path: relativePath,
@@ -368,10 +553,25 @@ class InstallationPlanner {
 				return 0;
 			});
 
+			// Fix: Track valid sizes for BytesToInstall and BytesToUpdate
+			let bytesToInstall = 0;
+			let bytesToUpdate = 0;
+			let largestInstall = 0;
+			let largestUpdate = 0;
+
 			const actions = [];
 			let actionCounter = 1;
 			for (const a of unsortedActions) {
 				a.id = `ACT-${String(actionCounter++).padStart(6, '0')}`;
+				
+				if (a.type === ActionType.INSTALL) {
+					bytesToInstall += a.estimatedBytes || 0;
+					if ((a.estimatedBytes || 0) > largestInstall) largestInstall = a.estimatedBytes || 0;
+				} else if (a.type === ActionType.UPDATE) {
+					bytesToUpdate += a.estimatedBytes || 0;
+					if ((a.estimatedBytes || 0) > largestUpdate) largestUpdate = a.estimatedBytes || 0;
+				}
+
 				Object.freeze(a);
 				actions.push(a);
 			}
@@ -415,10 +615,10 @@ class InstallationPlanner {
 			
 			const stats = {
 				PlanningDuration: duration,
-				BytesToInstall: 0,
-				BytesToUpdate: 0,
-				LargestInstall: 0,
-				LargestUpdate: 0,
+				BytesToInstall: bytesToInstall,
+				BytesToUpdate: bytesToUpdate,
+				LargestInstall: largestInstall,
+				LargestUpdate: largestUpdate,
 				RepositoryEntryCount: repoMap.size,
 				VaultEntryCount: localMap.size,
 				ManagedEntryCount: actions.length
@@ -432,7 +632,7 @@ class InstallationPlanner {
 			this.state = 'completed';
 
 			console.log("[Planner] Planning complete.");
-			this.plugin.statusBarItemEl.setText("GATE: Plan Ready");
+			this.plugin.statusBarItemEl.setText("✅ GATE: Plan Ready");
 			this.plugin.notifyUI();
 
 		} catch (error) {
@@ -441,7 +641,7 @@ class InstallationPlanner {
 			errors.push(error.message);
 			const validation = { isValid: false, errors: [...errors], warnings: [...warnings] };
 			this.result = new PlanningResult(repoModel, vaultModel, stateModel, null, {}, {}, validation, Date.now() - startTime);
-			this.plugin.statusBarItemEl.setText("GATE: Planning Failed");
+			this.plugin.statusBarItemEl.setText("❌ GATE: Planning Failed");
 			this.plugin.notifyUI();
 		}
 	}
@@ -449,15 +649,49 @@ class InstallationPlanner {
 
 class StateMigrator {
 	migrate(rawData, currentPluginVersion) {
-		const data = rawData || {};
+		// 3. Detect corrupted state: prevent null/undefined from crashing the migrator
+		let data = (rawData && typeof rawData === 'object') ? JSON.parse(JSON.stringify(rawData)) : {};
+
+		// 4. Preserve backward compatibility: Handle legacy flat structure
+		if (!data.stateVersion && data.installedFiles) {
+			data.stateVersion = 1;
+		}
+
+		// 1. Proper version migration
 		if (!data.stateVersion) data.stateVersion = 1;
+		
+		// Set defaults for missing fields
 		if (!data.pluginVersion) data.pluginVersion = currentPluginVersion;
 		if (!data.installedRepository) data.installedRepository = "None";
 		if (!data.installedVersion) data.installedVersion = "None";
 		if (!data.installationType) data.installationType = "None";
-		if (!data.installedFiles) data.installedFiles = [];
 		if (!data.history) data.history = {};
 		if (!data.statistics) data.statistics = {};
+
+		if (!Array.isArray(data.installedFiles)) {
+			data.installedFiles = [];
+		}
+
+		// 5. Prevent duplicate installed entries
+		const uniqueFiles = new Map();
+		for (const file of data.installedFiles) {
+			if (file && typeof file === 'object' && typeof file.path === 'string') {
+				// Later entries override earlier ones to keep the most recent state
+				uniqueFiles.set(file.path, file);
+			}
+		}
+		data.installedFiles = Array.from(uniqueFiles.values());
+
+		// 6. Validate statistics consistency (Auto-repair during migration)
+		data.statistics.installedFiles = data.installedFiles.length;
+
+		// Ensure all statistics fields are present and valid numbers
+		if (typeof data.statistics.mergedFiles !== 'number') data.statistics.mergedFiles = 0;
+		if (typeof data.statistics.ignoredFiles !== 'number') data.statistics.ignoredFiles = 0;
+		if (typeof data.statistics.archivedFiles !== 'number') data.statistics.archivedFiles = 0;
+		if (typeof data.statistics.conflicts !== 'number') data.statistics.conflicts = 0;
+		if (typeof data.statistics.lastPlanningDuration !== 'number') data.statistics.lastPlanningDuration = 0;
+
 		return data;
 	}
 }
@@ -465,22 +699,50 @@ class StateMigrator {
 class StateValidator {
 	validate(state, initialErrors = []) {
 		const result = { isValid: true, errors: [...initialErrors], warnings: [] };
-		if (!state) {
-			result.errors.push("State object is null or undefined.");
-		} else {
-			if (typeof state.stateVersion !== 'number' || state.stateVersion < 1) result.errors.push("Invalid state version.");
-			if (!Array.isArray(state.installedFiles)) result.errors.push("'installedFiles' must be an array.");
-			else {
-				const seenPaths = new Set();
-				for (const file of state.installedFiles) {
-					if (!file.path) { result.errors.push("Installed file entry is missing 'path'."); continue; }
-					if (seenPaths.has(file.path)) result.errors.push(`Duplicate file entry in state: ${file.path}`);
-					seenPaths.add(file.path);
-				}
-			}
-			if (typeof state.history !== 'object') result.errors.push("'history' must be an object.");
-			if (typeof state.statistics !== 'object') result.errors.push("'statistics' must be an object.");
+		
+		// 3. Detect corrupted state
+		if (!state || typeof state !== 'object') {
+			result.errors.push("State object is null or severely corrupted.");
+			result.isValid = false;
+			return result;
+		} 
+		
+		// 2. State validation
+		if (typeof state.stateVersion !== 'number' || state.stateVersion < 1) {
+			result.errors.push("Invalid or missing state version.");
 		}
+		
+		if (!Array.isArray(state.installedFiles)) {
+			result.errors.push("'installedFiles' must be an array.");
+		} else {
+			const seenPaths = new Set();
+			for (const file of state.installedFiles) {
+				if (!file || typeof file !== 'object') {
+					result.errors.push("Invalid file entry format detected in state.");
+					continue;
+				}
+				if (!file.path || typeof file.path !== 'string') { 
+					result.errors.push("Installed file entry is missing a valid 'path'."); 
+					continue; 
+				}
+				if (seenPaths.has(file.path)) {
+					// 5. Catch any duplicates that bypassed migration
+					result.errors.push(`Duplicate file entry in state: ${file.path}`);
+				}
+				seenPaths.add(file.path);
+			}
+		}
+		
+		if (typeof state.history !== 'object' || state.history === null) {
+			result.errors.push("'history' must be a valid object.");
+		}
+		if (typeof state.statistics !== 'object' || state.statistics === null) {
+			result.errors.push("'statistics' must be a valid object.");
+		} else if (state.installedFiles && state.statistics.installedFiles !== state.installedFiles.length) {
+			// 6. Validate statistics consistency
+			result.warnings.push("Statistics mismatch: 'installedFiles' count does not match the actual array length.");
+		}
+		
 		if (result.errors.length > 0) result.isValid = false;
 		return result;
 	}
@@ -488,33 +750,42 @@ class StateValidator {
 
 class StateModel {
 	constructor(data, validation) {
-		this.pluginVersion = data.pluginVersion;
-		this.stateVersion = data.stateVersion;
-		this.installedRepository = data.installedRepository;
-		this.installedVersion = data.installedVersion;
+		// `data` may legitimately be `{}` (e.g. the error-recovery path in StateLoader.load()
+		// calls `new StateModel({}, validation)`), so every nested field must be defaulted
+		// defensively rather than dereferenced directly — otherwise the recovery path itself
+		// throws, and the plugin never reaches a clean "invalid state" UI.
+		data = data || {};
+		const statistics = data.statistics || {};
+		const history = data.history || {};
+		const installedFiles = Array.isArray(data.installedFiles) ? data.installedFiles : [];
+
+		this.pluginVersion = data.pluginVersion || null;
+		this.stateVersion = data.stateVersion || null;
+		this.installedRepository = data.installedRepository || null;
+		this.installedVersion = data.installedVersion || null;
 		this.installationDate = data.installationDate || null;
 		this.lastUpdate = data.lastUpdate || null;
 		this.lastRestore = data.lastRestore || null;
-		this.installationType = data.installationType;
+		this.installationType = data.installationType || null;
 		this.statistics = Object.freeze({
-			installedFiles: data.statistics.installedFiles || 0,
-			mergedFiles: data.statistics.mergedFiles || 0,
-			ignoredFiles: data.statistics.ignoredFiles || 0,
-			archivedFiles: data.statistics.archivedFiles || 0,
-			conflicts: data.statistics.conflicts || 0,
-			lastPlanningDuration: data.statistics.lastPlanningDuration || 0
+			installedFiles: statistics.installedFiles || 0,
+			mergedFiles: statistics.mergedFiles || 0,
+			ignoredFiles: statistics.ignoredFiles || 0,
+			archivedFiles: statistics.archivedFiles || 0,
+			conflicts: statistics.conflicts || 0,
+			lastPlanningDuration: statistics.lastPlanningDuration || 0
 		});
-		this.installedFiles = Object.freeze(data.installedFiles.map(f => Object.freeze({ ...f })));
+		this.installedFiles = Object.freeze(installedFiles.map(f => Object.freeze({ ...f })));
 		this.history = Object.freeze({
-			firstInstall: data.history.firstInstall || null,
-			lastInstall: data.history.lastInstall || null,
-			lastUpdate: data.history.lastUpdate || null,
-			lastRestore: data.history.lastRestore || null
+			firstInstall: history.firstInstall || null,
+			lastInstall: history.lastInstall || null,
+			lastUpdate: history.lastUpdate || null,
+			lastRestore: history.lastRestore || null
 		});
-		this.validation = Object.freeze(validation);
-		this.errors = this.validation.errors;
-		this.warnings = this.validation.warnings;
-		this.isValid = this.validation.isValid;
+		this.validation = Object.freeze(validation || { isValid: false, errors: ['No validation result provided.'], warnings: [] });
+		this.errors = this.validation.errors || [];
+		this.warnings = this.validation.warnings || [];
+		this.isValid = !!this.validation.isValid;
 		Object.freeze(this);
 	}
 }
@@ -524,23 +795,37 @@ class StateLoader {
 		this.plugin = plugin;
 		this.resetState();
 	}
+	
 	resetState() {
 		this.state = 'idle';
 		this.model = null;
 	}
+	
 	async load() {
 		this.resetState();
 		this.state = 'loading';
 		console.log("[GATE Manager] Loading Plugin State...");
 		if (this.plugin.statusBarItemEl) {
-			this.plugin.statusBarItemEl.setText("GATE: Loading Plugin State...");
+			this.plugin.statusBarItemEl.setText("⏳ GATE: Loading Plugin State...");
 		}
 		this.plugin.notifyUI();
 
 		try {
-			const rawData = await this.plugin.loadData();
+			const loadedData = await this.plugin.loadData() || {};
+			
+			// 4. Preserve backward compatibility by checking where state is stored
+			let rawStateData = {};
+			if (loadedData.state) {
+				rawStateData = loadedData.state;
+			} else {
+				// Legacy structure: state keys were placed directly at the root level alongside settings
+				rawStateData = { ...loadedData };
+				delete rawStateData.settings; // Ensure settings are excluded from state object
+			}
+
 			const migrator = new StateMigrator();
-			const migratedData = migrator.migrate(rawData, this.plugin.manifest.version);
+			const migratedData = migrator.migrate(rawStateData, this.plugin.manifest.version);
+			
 			const validator = new StateValidator();
 			const validation = validator.validate(migratedData);
 
@@ -549,12 +834,12 @@ class StateLoader {
 
 			if (this.model.isValid) {
 				console.log("[GATE Manager] Plugin state loaded successfully.");
-				if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("GATE: State Ready");
+				if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("✅ GATE: State Ready");
 				this.plugin.vaultStatus.installedVersion = this.model.installedVersion !== "None" ? this.model.installedVersion : null;
 				this.plugin.vaultStatus.isInstalled = !!this.plugin.vaultStatus.installedVersion;
 			} else {
 				console.warn("[GATE Manager] Plugin state validation failed.", this.model.errors);
-				if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("GATE: State Invalid");
+				if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("❌ GATE: State Invalid");
 			}
 			this.plugin.notifyUI();
 		} catch (error) {
@@ -562,31 +847,42 @@ class StateLoader {
 			this.state = 'failed';
 			const validation = { isValid: false, errors: [error.message], warnings: [] };
 			this.model = new StateModel({}, validation);
-			if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("GATE: State Invalid");
+			if (this.plugin.statusBarItemEl) this.plugin.statusBarItemEl.setText("❌ GATE: State Invalid");
 			this.plugin.notifyUI();
 		}
 	}
 }
 
 class HashService {
-	static getFileHash(absolutePath) {
-		return new Promise((resolve, reject) => {
-			if (!fs.existsSync(absolutePath)) return reject(new Error("File does not exist."));
-			const hash = crypto.createHash('sha256');
-			const stream = fs.createReadStream(absolutePath);
-			stream.on('data', data => hash.update(data));
-			stream.on('end', () => resolve(hash.digest('hex')));
-			stream.on('error', err => reject(err));
-		});
+	// Fix: Read text files to normalize Windows/Linux CRLF before hashing
+	static async getFileHash(absolutePath) {
+		if (!fs.existsSync(absolutePath)) throw new Error("File does not exist.");
+		const hash = crypto.createHash('sha256');
+		const ext = path.extname(absolutePath).toLowerCase();
+		const textExts = ['.md', '.txt', '.json', '.csv', '.js', '.css', '.html', '.xml', '.yaml', '.yml', '.svg'];
+
+		if (textExts.includes(ext)) {
+			let content = await fs.promises.readFile(absolutePath, 'utf8');
+			content = content.replace(/\r\n/g, '\n');
+			hash.update(content, 'utf8');
+			return hash.digest('hex');
+		} else {
+			return new Promise((resolve, reject) => {
+				const stream = fs.createReadStream(absolutePath);
+				stream.on('data', data => hash.update(data));
+				stream.on('end', () => resolve(hash.digest('hex')));
+				stream.on('error', err => reject(err));
+			});
+		}
 	}
 }
 
 class FileScanner {
-	static scan(rootPath, relativePath) {
+	static async scanAsync(rootPath, relativePath) {
 		const absolutePath = path.join(rootPath, relativePath);
 		const normalizedRel = relativePath.replace(/\\/g, '/');
 		try {
-			const stats = fs.statSync(absolutePath);
+			const stats = await fs.promises.stat(absolutePath);
 			const ext = path.extname(normalizedRel).toLowerCase();
 			const isMarkdown = ext === '.md';
 			const textExts = ['.md', '.txt', '.json', '.csv', '.js', '.css', '.html', '.xml', '.yaml', '.yml', '.svg'];
@@ -602,7 +898,8 @@ class DirectoryScanner {
 	static scan(rootPath, relativePath, childrenCount = 0) {
 		const normalizedRel = relativePath.replace(/\\/g, '/');
 		try {
-			let parent = path.dirname(normalizedRel);
+			// Fix: Force POSIX directory name to keep forward slash format intact
+			let parent = path.posix.dirname(normalizedRel);
 			if (parent === '.' || parent === normalizedRel) parent = '';
 			const depth = normalizedRel === '' ? 0 : normalizedRel.split('/').length;
 			return Object.freeze({ relativePath: normalizedRel, parent, depth, childrenCount, exists: true });
@@ -653,7 +950,7 @@ class VaultScanner {
 		this.resetState();
 		this.state = 'scanning';
 		console.log("[GATE Manager] Starting Local Vault Scan...");
-		this.plugin.statusBarItemEl.setText("GATE: Scanning Vault...");
+		this.plugin.statusBarItemEl.setText("🔄 GATE: Scanning Vault...");
 		this.plugin.notifyUI();
 
 		try {
@@ -663,38 +960,56 @@ class VaultScanner {
 			const files = [];
 			const errors = [];
 			const queue = ['']; 
+			let rootDirChildren = 0; // childrenCount for the vault root itself (currentRelPath === '')
 			
+			// Fix: Make directory reads non-blocking asynchronous calls
 			while (queue.length > 0) {
 				const currentRelPath = queue.shift();
 				const currentAbsPath = path.join(vaultRoot, currentRelPath);
 				try {
-					const items = fs.readdirSync(currentAbsPath, { withFileTypes: true });
+					const items = await fs.promises.readdir(currentAbsPath, { withFileTypes: true });
 					let childrenCount = 0;
+					
+					const filePromises = [];
 					for (const item of items) {
+						if (item.isSymbolicLink()) continue; // Fix: Prevent traversing infinite symlinks
+
 						const itemRelPath = currentRelPath ? path.join(currentRelPath, item.name) : item.name;
 						const normalizedItemRel = itemRelPath.replace(/\\/g, '/');
 						if (normalizedItemRel.startsWith('.obsidian/plugins/gate-manager/cache')) continue;
+						
 						childrenCount++;
 						if (item.isDirectory()) {
 							queue.push(itemRelPath);
 							directoriesMap.set(normalizedItemRel, { path: itemRelPath, childrenCount: 0 });
 						} else if (item.isFile()) {
-							files.push(FileScanner.scan(vaultRoot, itemRelPath));
+							filePromises.push(FileScanner.scanAsync(vaultRoot, itemRelPath));
 						} else {
-							files.push(Object.freeze({ relativePath: normalizedItemRel, exists: false, error: 'Unsupported file type or broken symlink' }));
+							files.push(Object.freeze({ relativePath: normalizedItemRel, exists: false, error: 'Unsupported file type' }));
 						}
 					}
+					// Parallel non-blocking stats for files in current dir
+					const scannedFiles = await Promise.all(filePromises);
+					files.push(...scannedFiles);
+
 					if (currentRelPath !== '') {
 						const normalizedCurrent = currentRelPath.replace(/\\/g, '/');
 						const dirData = directoriesMap.get(normalizedCurrent);
 						if (dirData) dirData.childrenCount = childrenCount;
+					} else {
+						// This is the vault root's own scan pass — record its childrenCount
+						// directly. Previously this count was computed but then discarded
+						// (only non-root paths were written into directoriesMap), and the
+						// root's childrenCount was reconstructed afterwards by grabbing
+						// whichever directory happened to be inserted first into the Map —
+						// i.e. an essentially arbitrary subdirectory, not the root at all.
+						rootDirChildren = childrenCount;
 					}
 				} catch (err) {
 					errors.push(`Unreadable directory: ${currentRelPath} (${err.message})`);
 				}
 			}
 
-			const rootDirChildren = directoriesMap.size > 0 ? Array.from(directoriesMap.values())[0].childrenCount : files.length;
 			const directories = [DirectoryScanner.scan(vaultRoot, '', rootDirChildren)];
 			for (const [normalizedPath, data] of directoriesMap.entries()) {
 				directories.push(DirectoryScanner.scan(vaultRoot, data.path, data.childrenCount));
@@ -721,12 +1036,12 @@ class VaultScanner {
 			this.state = 'completed';
 
 			console.log("[GATE Manager] Vault Scan Complete.");
-			this.plugin.statusBarItemEl.setText("GATE: Vault Ready");
+			this.plugin.statusBarItemEl.setText("✅ GATE: Vault Ready");
 			this.plugin.notifyUI();
 		} catch (err) {
 			this.state = 'failed';
 			console.error("[GATE Manager] Vault Scan Failed", err);
-			this.plugin.statusBarItemEl.setText("GATE: Vault Scan Failed");
+			this.plugin.statusBarItemEl.setText("❌ GATE: Vault Scan Failed");
 			this.plugin.notifyUI();
 		}
 	}
@@ -833,7 +1148,7 @@ class RepositoryModelLoader {
 		this.resetState();
 		this.state = 'loading';
 		console.log(`[GATE Manager] Loading Repository Model from: ${archiveRoot}`);
-		this.plugin.statusBarItemEl.setText("GATE: Loading Repository...");
+		this.plugin.statusBarItemEl.setText("⏳ GATE: Loading Repository...");
 		this.plugin.notifyUI();
 
 		try {
@@ -847,7 +1162,7 @@ class RepositoryModelLoader {
 			const index = indexReader.read(archiveRoot, errors);
 
 			this.state = 'validating';
-			this.plugin.statusBarItemEl.setText("GATE: Validating Repository...");
+			this.plugin.statusBarItemEl.setText("⏳ GATE: Validating Repository...");
 			this.plugin.notifyUI();
 
 			const validator = new RepositoryValidator();
@@ -857,18 +1172,18 @@ class RepositoryModelLoader {
 
 			if (this.model.isValid) {
 				console.log("[GATE Manager] Repository validation completed successfully.");
-				this.plugin.statusBarItemEl.setText("GATE: Repository Ready");
+				this.plugin.statusBarItemEl.setText("✅ GATE: Repository Ready");
 			} else {
 				console.warn("[GATE Manager] Repository validation failed.", this.model.errors);
-				this.plugin.statusBarItemEl.setText("GATE: Repository Invalid");
+				this.plugin.statusBarItemEl.setText("❌ GATE: Repository Invalid");
 			}
 			this.plugin.notifyUI();
 		} catch (error) {
 			console.error("[GATE Manager] Repository Loader Exception:", error);
-			this.state = 'completed';
+			this.state = 'failed';
 			const validation = { isValid: false, errors: [error.message], warnings: [] };
 			this.model = new RepositoryModel(null, null, null, validation);
-			this.plugin.statusBarItemEl.setText("GATE: Repository Invalid");
+			this.plugin.statusBarItemEl.setText("❌ GATE: Repository Invalid");
 			this.plugin.notifyUI();
 		}
 	}
@@ -879,21 +1194,39 @@ class TempDirectoryManager {
 	getCacheDir() { return path.join(this.plugin.app.vault.adapter.getBasePath(), this.plugin.manifest.dir, 'cache'); }
 	getArchivePath() { return path.join(this.getCacheDir(), 'download.zip'); }
 	getExtractedDir() { return path.join(this.getCacheDir(), 'extracted'); }
-	prepareCache() {
+	
+	async prepareCache() {
 		const cacheDir = this.getCacheDir();
-		if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+		if (!fs.existsSync(cacheDir)) {
+			await fs.promises.mkdir(cacheDir, { recursive: true });
+		}
 	}
-	cleanExtracted() {
+	
+	async cleanExtracted() {
 		const extractedDir = this.getExtractedDir();
-		if (fs.existsSync(extractedDir)) fs.rmSync(extractedDir, { recursive: true, force: true });
+		if (fs.existsSync(extractedDir)) {
+			try {
+				await fs.promises.rm(extractedDir, { recursive: true, force: true });
+			} catch (e) {
+				console.warn("[GATE Manager] Could not delete extracted dir (possibly locked):", e);
+			}
+		}
 	}
-	createExtracted() {
-		this.cleanExtracted();
-		fs.mkdirSync(this.getExtractedDir(), { recursive: true });
+	
+	async createExtracted() {
+		await this.cleanExtracted();
+		await fs.promises.mkdir(this.getExtractedDir(), { recursive: true });
 	}
-	cleanAll() {
+	
+	async cleanAll() {
 		const cacheDir = this.getCacheDir();
-		if (fs.existsSync(cacheDir)) fs.rmSync(cacheDir, { recursive: true, force: true });
+		if (fs.existsSync(cacheDir)) {
+			try {
+				await fs.promises.rm(cacheDir, { recursive: true, force: true });
+			} catch (e) {
+				console.warn("[GATE Manager] Could not fully delete cache dir (possibly locked):", e);
+			}
+		}
 	}
 }
 
@@ -903,6 +1236,8 @@ class ArchiveReader {
 	readCentralDirectory() {
 		const stats = fs.statSync(this.filePath);
 		if (stats.size === 0) throw new Error("Archive file is empty.");
+		
+		// Fix: Improved corrupted ZIP recovery & safely detecting malformed archives
 		let fd = null;
 		try {
 			fd = fs.openSync(this.filePath, 'r');
@@ -914,11 +1249,17 @@ class ArchiveReader {
 			for (let i = buffer.length - 22; i >= 0; i--) {
 				if (buffer.readUInt32LE(i) === 0x06054b50) { eocdOffset = i; break; }
 			}
-			if (eocdOffset === -1) throw new Error("Not a valid ZIP file (Signature missing).");
+			if (eocdOffset === -1) throw new Error("Not a valid ZIP file (EOCD Signature missing).");
+
+			if (eocdOffset + 22 > buffer.length) throw new Error("Malformed archive: EOCD record truncated.");
 
 			const cdEntries = buffer.readUInt16LE(eocdOffset + 10);
 			const cdSize = buffer.readUInt32LE(eocdOffset + 12);
 			const cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+
+			if (cdOffset + cdSize > stats.size) {
+				throw new Error("Malformed archive: Central Directory is out of bounds (corrupted data).");
+			}
 
 			const cdBuffer = Buffer.alloc(cdSize);
 			fs.readSync(fd, cdBuffer, 0, cdSize, cdOffset);
@@ -926,7 +1267,13 @@ class ArchiveReader {
 			const entries = [];
 			let offset = 0;
 			for (let i = 0; i < cdEntries; i++) {
-				if (cdBuffer.readUInt32LE(offset) !== 0x02014b50) break;
+				if (offset + 46 > cdBuffer.length) {
+					throw new Error("Malformed archive: Central Directory entry overflows buffer.");
+				}
+				if (cdBuffer.readUInt32LE(offset) !== 0x02014b50) {
+					throw new Error("Malformed archive: Invalid Central Directory signature.");
+				}
+
 				const compMethod = cdBuffer.readUInt16LE(offset + 10);
 				const compSize = cdBuffer.readUInt32LE(offset + 20);
 				const uncompSize = cdBuffer.readUInt32LE(offset + 24);
@@ -935,7 +1282,17 @@ class ArchiveReader {
 				const commentLen = cdBuffer.readUInt16LE(offset + 32);
 				const localHeaderOffset = cdBuffer.readUInt32LE(offset + 42);
 
+				if (offset + 46 + nameLen + extraLen + commentLen > cdBuffer.length) {
+					throw new Error("Malformed archive: Entry header exceeds Central Directory boundary.");
+				}
+
 				const name = cdBuffer.toString('utf8', offset + 46, offset + 46 + nameLen);
+				
+				// Fix: ZIP bomb & Directory Traversal protection
+				if (name.includes('../') || name.includes('..\\') || name.startsWith('/') || name.startsWith('\\') || name.includes('\0')) {
+					throw new Error(`Security Exception: Path traversal attempt detected in archive entry: ${name}`);
+				}
+
 				entries.push({ name, compMethod, compSize, uncompSize, localHeaderOffset });
 				offset += 46 + nameLen + extraLen + commentLen;
 			}
@@ -946,22 +1303,34 @@ class ArchiveReader {
 	}
 
 	extractFileToMemory(entry) {
+		const stats = fs.statSync(this.filePath);
 		let fd = null;
 		try {
 			fd = fs.openSync(this.filePath, 'r');
+			if (entry.localHeaderOffset + 30 > stats.size) {
+				throw new Error("Malformed archive: Local File Header out of bounds.");
+			}
+
 			const headerBuffer = Buffer.alloc(30);
 			fs.readSync(fd, headerBuffer, 0, 30, entry.localHeaderOffset);
-			if (headerBuffer.readUInt32LE(0) !== 0x04034b50) throw new Error("Archive is corrupted (Invalid Local File Header).");
+			if (headerBuffer.readUInt32LE(0) !== 0x04034b50) throw new Error("Archive is corrupted (Invalid Local File Header signature).");
 
 			const nameLen = headerBuffer.readUInt16LE(26);
 			const extraLen = headerBuffer.readUInt16LE(28);
 			const dataOffset = entry.localHeaderOffset + 30 + nameLen + extraLen;
+			
+			if (dataOffset + entry.compSize > stats.size) {
+				throw new Error("Malformed archive: Compressed file data exceeds archive boundary.");
+			}
+
 			const dataBuffer = Buffer.alloc(entry.compSize);
 			fs.readSync(fd, dataBuffer, 0, entry.compSize, dataOffset);
 
 			if (entry.compMethod === 0) return dataBuffer;
 			else if (entry.compMethod === 8) return zlib.inflateRawSync(dataBuffer);
 			else throw new Error(`Unsupported compression method: ${entry.compMethod}`);
+		} catch (err) {
+			throw new Error(`Memory extraction failed for ${entry.name}: ${err.message}`);
 		} finally {
 			if (fd !== null) fs.closeSync(fd);
 		}
@@ -971,39 +1340,72 @@ class ArchiveReader {
 		return new Promise((resolve, reject) => {
 			let fd = null;
 			try {
+				const stats = fs.statSync(this.filePath);
 				fd = fs.openSync(this.filePath, 'r');
+				
+				if (entry.localHeaderOffset + 30 > stats.size) {
+					throw new Error("Malformed archive: Local File Header out of bounds.");
+				}
+
 				const headerBuffer = Buffer.alloc(30);
 				fs.readSync(fd, headerBuffer, 0, 30, entry.localHeaderOffset);
-				if (headerBuffer.readUInt32LE(0) !== 0x04034b50) throw new Error("Archive is corrupted (Invalid Local File Header).");
+				if (headerBuffer.readUInt32LE(0) !== 0x04034b50) throw new Error("Archive is corrupted (Invalid Local File Header signature).");
 
 				const nameLen = headerBuffer.readUInt16LE(26);
 				const extraLen = headerBuffer.readUInt16LE(28);
 				const dataOffset = entry.localHeaderOffset + 30 + nameLen + extraLen;
 				
+				if (dataOffset + entry.compSize > stats.size) {
+					throw new Error("Malformed archive: Compressed file data exceeds archive boundary.");
+				}
+
 				fs.closeSync(fd);
 				fd = null;
 
 				if (entry.compSize === 0) {
+					if (entry.uncompSize !== 0) throw new Error(`Malformed archive: entry ${entry.name} has no compressed data but uncompressed size is > 0.`);
 					fs.writeFileSync(destPath, '');
-					return resolve();
+					return resolve({ actualSize: 0, hash: crypto.createHash('sha256').digest('hex') });
 				}
 
 				const readStream = fs.createReadStream(this.filePath, { start: dataOffset, end: dataOffset + entry.compSize - 1 });
 				const writeStream = fs.createWriteStream(destPath);
 				
-				readStream.on('error', reject);
-				writeStream.on('error', reject);
-				writeStream.on('finish', resolve);
+				// Fix: Compute hash and actual size during stream for integrity verification
+				const hasher = crypto.createHash('sha256');
+				let actualSize = 0;
 
-				if (entry.compMethod === 0) readStream.pipe(writeStream);
+				const dataHandler = (chunk) => {
+					actualSize += chunk.length;
+					hasher.update(chunk);
+				};
+				
+				const cleanup = (err) => {
+					readStream.destroy();
+					writeStream.destroy();
+					reject(new Error(`Disk extraction failed for ${entry.name}: ${err.message}`));
+				};
+
+				readStream.on('error', cleanup);
+				writeStream.on('error', cleanup);
+				
+				writeStream.on('finish', () => {
+					resolve({ actualSize, hash: hasher.digest('hex') });
+				});
+
+				if (entry.compMethod === 0) {
+					readStream.on('data', dataHandler);
+					readStream.pipe(writeStream);
+				}
 				else if (entry.compMethod === 8) {
 					const inflater = zlib.createInflateRaw();
-					inflater.on('error', reject);
+					inflater.on('error', cleanup);
+					inflater.on('data', dataHandler);
 					readStream.pipe(inflater).pipe(writeStream);
 				} else reject(new Error(`Unsupported compression method: ${entry.compMethod}`));
 			} catch (err) {
 				if (fd !== null) fs.closeSync(fd);
-				reject(err);
+				reject(new Error(`Extraction initialization failed for ${entry.name}: ${err.message}`));
 			}
 		});
 	}
@@ -1019,6 +1421,7 @@ class VaultStatus {
 		this.releaseNotes = "";
 		this.downloadUrl = null;
 		this.connectionStatus = "Offline"; 
+		this.authenticated = false; // true when the last successful check used a GitHub token
 	}
 	get statusText() {
 		if (this.connectionStatus !== "Connected") return this.connectionStatus;
@@ -1046,16 +1449,37 @@ class ArchiveVerificationManager {
 
 	async verify(archivePath) {
 		this.result = new VerificationResult(archivePath);
-		this.plugin.statusBarItemEl.setText("GATE: Verifying...");
+		this.plugin.statusBarItemEl.setText("⏳ GATE: Verifying...");
+
+		const MAX_FILE_COUNT = 50000;
+		const MAX_UNCOMPRESSED_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+		const MAX_COMPRESSION_RATIO = 150;
 
 		try {
 			if (!fs.existsSync(archivePath)) throw new Error("Archive missing from disk.");
-			const stats = fs.statSync(archivePath);
+			const stats = await fs.promises.stat(archivePath);
 			if (stats.size === 0) throw new Error("Archive file is empty (0 bytes).");
 			this.result.archiveSize = stats.size;
 
 			const zip = new ArchiveReader(archivePath);
 			const entries = zip.readCentralDirectory();
+			
+			// Fix: ZIP bomb protection (verify totals and ratios before extraction)
+			let totalUncompSize = 0;
+			if (entries.length > MAX_FILE_COUNT) {
+				throw new Error(`Security Exception: Archive contains too many files (${entries.length}). Limit is ${MAX_FILE_COUNT}.`);
+			}
+
+			for (const entry of entries) {
+				totalUncompSize += entry.uncompSize;
+				if (entry.compSize > 1024 && (entry.uncompSize / entry.compSize) > MAX_COMPRESSION_RATIO) {
+					throw new Error(`Security Exception: Suspicious compression ratio detected in ${entry.name} (ZIP bomb protection).`);
+				}
+			}
+
+			if (totalUncompSize > MAX_UNCOMPRESSED_SIZE) {
+				throw new Error(`Security Exception: Uncompressed payload exceeds maximum safe limit of 2GB.`);
+			}
 			
 			const manifestEntry = entries.find(e => e.name.endsWith('vault-manifest.json'));
 			if (manifestEntry) {
@@ -1071,6 +1495,7 @@ class ArchiveVerificationManager {
 						}
 					}
 				} catch(e) { 
+					if (e.message.includes('Plugin version incompatible')) throw e;
 					this.result.warnings.push("Manifest invalid (contains invalid JSON). Proceeding in generic mode.");
 				}
 			} else {
@@ -1104,8 +1529,52 @@ class ExtractionResult {
 
 class ExtractionVerifier {
 	constructor(plugin) { this.plugin = plugin; }
-	verify(archiveRoot) {
+
+	// Recursively count regular files under `dir` (directories don't count).
+	_countFilesRecursive(dir) {
+		let count = 0;
+		let entries;
+		try {
+			entries = fs.readdirSync(dir, { withFileTypes: true });
+		} catch (e) {
+			return count;
+		}
+		for (const entry of entries) {
+			if (entry.isSymbolicLink()) continue;
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				count += this._countFilesRecursive(full);
+			} else if (entry.isFile()) {
+				count++;
+			}
+		}
+		return count;
+	}
+	
+	verify(archiveRoot, expectedFileCount) {
 		if (!fs.existsSync(archiveRoot)) return false;
+		
+		try {
+			const stats = fs.statSync(archiveRoot);
+			if (!stats.isDirectory()) return false;
+			
+			// Fix: Verify the extraction actually produced (at least) the expected number of
+			// files, counted recursively across the whole tree. The previous check only
+			// confirmed the top-level directory was non-empty (fs.readdirSync(archiveRoot).length
+			// > 0), so an archive that was supposed to contain hundreds of files nested in
+			// subfolders, but which silently stopped extracting after just one top-level entry,
+			// would still pass. Comparing against a real recursive count catches that.
+			if (expectedFileCount > 0) {
+				const actualFileCount = this._countFilesRecursive(archiveRoot);
+				if (actualFileCount < expectedFileCount) {
+					console.error(`[GATE Manager] Extraction verification failed: expected at least ${expectedFileCount} files, found ${actualFileCount}.`);
+					return false;
+				}
+			}
+		} catch (e) {
+			return false;
+		}
+		
 		return true;
 	}
 }
@@ -1121,13 +1590,13 @@ class ArchiveExtractionManager {
 	async extract(archivePath) {
 		this.resetState();
 		this.state = 'extracting';
-		this.plugin.statusBarItemEl.setText("GATE: Preparing Extraction...");
+		this.plugin.statusBarItemEl.setText("🔄 GATE: Preparing Extraction...");
 		this.plugin.notifyUI();
 
 		const tempManager = this.plugin.tempManager;
 		
 		try {
-			tempManager.createExtracted();
+			await tempManager.createExtracted();
 			const destDir = tempManager.getExtractedDir();
 			this.result.cacheDirectory = destDir;
 
@@ -1152,37 +1621,93 @@ class ArchiveExtractionManager {
 			this.result.archiveRoot = rootFolderName ? path.join(destDir, rootFolderName) : destDir;
 			this.result.manifestPath = path.join(this.result.archiveRoot, 'vault-manifest.json');
 
+			const extractedFilesMap = new Map(); // Store path -> { size, hash }
+
 			for (let i = 0; i < entries.length; i++) {
 				const entry = entries[i];
 				const fullPath = path.resolve(destDir, entry.name);
-				if (!fullPath.startsWith(path.resolve(destDir))) {
-					this.result.warnings.push(`Skipped invalid path: ${entry.name}`);
+				
+				if (!isPathInside(fullPath, destDir)) {
+					this.result.warnings.push(`Skipped invalid path (Traversal blocked): ${entry.name}`);
 					continue;
 				}
 
 				if (entry.name.endsWith('/')) {
-					fs.mkdirSync(fullPath, { recursive: true });
+					await fs.promises.mkdir(fullPath, { recursive: true });
 					this.result.totalDirectories++;
 				} else {
-					fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-					await reader.extractFileToDisk(entry, fullPath);
+					await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+					
+					// Fix: Capture actual extracted size and SHA256 hash
+					const extractData = await reader.extractFileToDisk(entry, fullPath);
+					
+					// Fix: Verify extracted file sizes match internal ZIP metadata precisely
+					if (extractData.actualSize !== entry.uncompSize) {
+						throw new Error(`Size mismatch for ${entry.name}: expected ${entry.uncompSize} bytes, got ${extractData.actualSize} bytes. Archive is corrupted.`);
+					}
+
+					let relPath = entry.name;
+					if (rootFolderName && relPath.startsWith(rootFolderName + '/')) {
+						relPath = relPath.substring(rootFolderName.length + 1);
+					}
+					extractedFilesMap.set(relPath, extractData);
+
 					this.result.totalFiles++;
 					this.result.totalBytes += entry.uncompSize;
 				}
 
 				this.progress.extractedEntries++;
 				if (i % 25 === 0) {
-					this.plugin.statusBarItemEl.setText(`GATE: Extracting ${this.progress.extractedEntries} / ${this.progress.totalEntries}`);
+					this.plugin.statusBarItemEl.setText(`🔄 GATE: Extracting ${this.progress.extractedEntries}/${this.progress.totalEntries}`);
 					this.plugin.notifyUI();
 				}
 			}
 
 			this.state = 'verifying';
-			this.plugin.statusBarItemEl.setText("GATE: Verifying Extraction...");
+			this.plugin.statusBarItemEl.setText("⏳ GATE: Verifying Extraction...");
 			this.plugin.notifyUI();
 
 			const verifier = new ExtractionVerifier(this.plugin);
-			if (!verifier.verify(this.result.archiveRoot)) throw new Error("Extraction verification failed: extraction output missing.");
+			if (!verifier.verify(this.result.archiveRoot, this.result.totalFiles)) {
+				throw new Error("Extraction verification failed: output directory is empty or missing.");
+			}
+
+			// Fix: Verify extracted hashes securely if vault-index.json is available
+			const indexPath = path.join(this.result.archiveRoot, 'vault-index.json');
+			if (fs.existsSync(indexPath)) {
+				let indexData;
+				try {
+					indexData = JSON.parse(await fs.promises.readFile(indexPath, 'utf8'));
+				} catch (e) {
+					// Fail closed: shipping vault-index.json means this repo opts into
+					// index-based integrity verification. If it can't be read or parsed, there
+					// is no way to confirm the extracted files match what the repo actually
+					// published — previously this only logged a warning and let installation
+					// proceed anyway, which defeats the purpose of shipping an index at all (a
+					// tampered or truncated release could ship a broken index specifically to
+					// bypass this check). Abort the whole extraction instead of continuing.
+					throw new Error(`Extraction verification failed: vault-index.json exists but could not be read or parsed (${e.message}). Aborting rather than installing unverified content.`);
+				}
+
+				if (indexData && Array.isArray(indexData.files)) {
+					for (const f of indexData.files) {
+						if (typeof f === 'object' && f.path && f.hash) {
+							const extracted = extractedFilesMap.get(f.path);
+							if (extracted) {
+								if (extracted.hash !== f.hash) {
+									this.result.warnings.push(`Hash mismatch for ${f.path}. Expected ${f.hash}, got ${extracted.hash}. Skipping this file.`);
+									
+									// Soft Fail: Delete the corrupted file from the temporary cache so the executor cannot install it.
+									const corruptedPath = path.join(this.result.archiveRoot, f.path);
+									if (fs.existsSync(corruptedPath)) {
+										await fs.promises.unlink(corruptedPath);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
 
 			this.state = 'completed';
 			this.result.success = true;
@@ -1190,38 +1715,134 @@ class ArchiveExtractionManager {
 		} catch (error) {
 			this.state = 'failed';
 			this.result.errors.push(error.message);
-			tempManager.cleanExtracted();
+			await tempManager.cleanExtracted();
 			this.plugin.notifyUI();
 		}
 	}
 }
 
 class GitHubService {
-	constructor(plugin) { this.plugin = plugin; this.cache = null; }
+	constructor(plugin) { 
+		this.plugin = plugin; 
+		this.cache = null; 
+		this.cacheTimestamp = 0;
+		this.CACHE_DURATION_MS = 60 * 60 * 1000; // 1 hour cache expiration
+		this.rateLimitReset = 0;
+	}
+
+	// A token means requests are billed against the user's personal 5,000/hr quota
+	// instead of the 60/hr quota shared by every device on the network's public IP.
+	isAuthenticated() {
+		return typeof this.plugin.settings.githubToken === 'string' && this.plugin.settings.githubToken.trim().length > 0;
+	}
+
+	_authHeaders() {
+		const headers = { 'Accept': 'application/vnd.github+json' };
+		if (this.isAuthenticated()) {
+			headers['Authorization'] = `Bearer ${this.plugin.settings.githubToken.trim()}`;
+		}
+		return headers;
+	}
+
+	// Cooldown between checks. Unauthenticated requests share a 60/hr network-wide budget,
+	// so they get a long, conservative cooldown. Authenticated requests use a token-scoped
+	// 5,000/hr budget and can safely check far more often.
+	getCooldownMs() {
+		return this.isAuthenticated() ? (15 * 60 * 1000) : (60 * 60 * 1000);
+	}
+
 	async refreshReleaseData(force = false) {
-		if (!force && this.cache) return this.cache;
+		const now = Date.now();
+		
+		// 2. Cache expiration
+		if (!force && this.cache && (now - this.cacheTimestamp < this.CACHE_DURATION_MS)) {
+			return this.cache;
+		}
+
 		const { repositoryOwner, repositoryName, releaseChannel } = this.plugin.settings;
 		if (!repositoryOwner || !repositoryName) {
 			this.plugin.vaultStatus.connectionStatus = "Configuration Error";
 			return null;
 		}
 
+		// FIX: Completely bypass the GitHub API when in DEV_MODE with a target version.
+		// This results in 0 API calls, guaranteeing you never hit GitHub's 60 req/hr rate limit.
+		if (DEV_MODE && this.plugin.settings.devTargetVersion) {
+			const devVersion = this.plugin.settings.devTargetVersion.trim();
+			console.log(`[GATE Manager] DEV_MODE: Bypassing GitHub API to avoid rate limits for target: ${devVersion}`);
+			
+			this.plugin.vaultStatus.repoName = `${repositoryOwner}/${repositoryName}`;
+			this.plugin.vaultStatus.latestVersion = devVersion;
+			this.plugin.vaultStatus.latestReleaseDate = "Developer Override";
+			this.plugin.vaultStatus.releaseNotes = "API bypassed in DEV_MODE to prevent rate limits. Check GitHub directly for release notes.";
+			
+			// Direct predictable URL structure for GitHub release tags
+			this.plugin.vaultStatus.downloadUrl = `https://github.com/${repositoryOwner}/${repositoryName}/archive/refs/tags/${devVersion}.zip`;
+			this.plugin.vaultStatus.connectionStatus = "Connected";
+			
+			const dummyRelease = { tag_name: devVersion, name: devVersion, prerelease: false };
+			this.cache = dummyRelease;
+			this.cacheTimestamp = Date.now();
+			return dummyRelease;
+		}
+
+		// Prevent requests if we know we are still rate-limited (Ignored in DEV_MODE to allow manual retries)
+		if (!DEV_MODE && now < this.rateLimitReset) {
+			const resetTime = new Date(this.rateLimitReset).toLocaleTimeString();
+			this.plugin.vaultStatus.connectionStatus = `Rate limited until ${resetTime}`;
+			return null;
+		}
+
 		try {
-			const repoResponse = await fetch(`https://api.github.com/repos/${repositoryOwner}/${repositoryName}`);
+			const authHeaders = this._authHeaders();
+			const repoResponse = await fetch(`https://api.github.com/repos/${repositoryOwner}/${repositoryName}`, { headers: authHeaders });
+			
+			// 1. Proper GitHub rate-limit handling
+			const remaining = repoResponse.headers.get('x-ratelimit-remaining');
+			const reset = repoResponse.headers.get('x-ratelimit-reset');
+			if (reset) this.rateLimitReset = parseInt(reset, 10) * 1000;
+
+			if (repoResponse.status === 401) throw new Error("Invalid GitHub token. Check the token in Advanced Settings.");
+			if (repoResponse.status === 403 && remaining === '0') {
+				const resetTime = new Date(this.rateLimitReset).toLocaleTimeString();
+				throw new Error(`Rate limited until ${resetTime}`);
+			}
 			if (repoResponse.status === 404) throw new Error("Repository not found");
-			if (repoResponse.status === 403) throw new Error("GitHub rate limit exceeded");
 			if (!repoResponse.ok) throw new Error(`GitHub API error: ${repoResponse.status}`);
 
 			const repoData = await repoResponse.json();
 			this.plugin.vaultStatus.repoName = repoData.full_name;
 
-			const releasesResponse = await fetch(`https://api.github.com/repos/${repositoryOwner}/${repositoryName}/releases`);
+			const releasesResponse = await fetch(`https://api.github.com/repos/${repositoryOwner}/${repositoryName}/releases`, { headers: authHeaders });
+			
+			const relRemaining = releasesResponse.headers.get('x-ratelimit-remaining');
+			const relReset = releasesResponse.headers.get('x-ratelimit-reset');
+			if (relReset) this.rateLimitReset = parseInt(relReset, 10) * 1000;
+
+			if (releasesResponse.status === 403 && relRemaining === '0') {
+				const resetTime = new Date(this.rateLimitReset).toLocaleTimeString();
+				throw new Error(`Rate limited until ${resetTime}`);
+			}
 			if (!releasesResponse.ok) throw new Error("Failed to fetch releases");
 			
 			const releases = await releasesResponse.json();
 			if (!releases || releases.length === 0) throw new Error("No releases found");
 
-			let targetRelease = releaseChannel === "stable" ? (releases.find(r => !r.prerelease) || releases[0]) : releases[0];
+			let targetRelease = null;
+
+			// 3. Stable semantic-version release selection
+			const getVersionName = (r) => r.tag_name || r.name || "0.0.0";
+			
+			if (releaseChannel === "stable") {
+				const stableReleases = releases.filter(r => !r.prerelease);
+				stableReleases.sort((a, b) => VersionUtils.compareVersions(getVersionName(b), getVersionName(a)));
+				// Fallback to latest overall if no stable releases exist
+				targetRelease = stableReleases.length > 0 ? stableReleases[0] : releases[0];
+			} else {
+				const allReleases = [...releases];
+				allReleases.sort((a, b) => VersionUtils.compareVersions(getVersionName(b), getVersionName(a)));
+				targetRelease = allReleases[0];
+			}
 
 			if (targetRelease) {
 				this.plugin.vaultStatus.latestVersion = targetRelease.tag_name || targetRelease.name;
@@ -1235,10 +1856,14 @@ class GitHubService {
 			}
 
 			this.plugin.vaultStatus.connectionStatus = "Connected";
+			this.plugin.vaultStatus.authenticated = this.isAuthenticated();
 			this.cache = targetRelease;
+			this.cacheTimestamp = Date.now();
 			return targetRelease;
 		} catch (error) {
 			if (error.message === "Failed to fetch") this.plugin.vaultStatus.connectionStatus = "Offline";
+			else if (error.message.includes("Rate limited")) this.plugin.vaultStatus.connectionStatus = error.message;
+			else if (error.message.includes("Invalid GitHub token")) this.plugin.vaultStatus.connectionStatus = error.message;
 			else this.plugin.vaultStatus.connectionStatus = "Repository Unavailable";
 			return null;
 		}
@@ -1247,6 +1872,7 @@ class GitHubService {
 
 class DownloadManager {
 	constructor(plugin) { this.plugin = plugin; this.resetState(); }
+	
 	resetState() {
 		this.state = 'idle';
 		this.progress = { received: 0, total: 0, percent: 0, speed: 0 };
@@ -1261,12 +1887,21 @@ class DownloadManager {
 			throw new Error("Invalid download URL.");
 		}
 
+		// Fail closed immediately: only https:// URLs on trusted GitHub hosts are ever
+		// attempted, before any cache directories are even created.
+		try {
+			assertSafeDownloadUrl(url);
+		} catch (validationError) {
+			this.plugin.showNotice(validationError.message);
+			throw validationError;
+		}
+
 		this.resetState();
 		this.state = 'downloading';
 		this.abortController = new AbortController();
 		
 		const tempManager = this.plugin.tempManager;
-		tempManager.prepareCache();
+		await tempManager.prepareCache();
 		this.destPath = tempManager.getArchivePath();
 
 		this.plugin.notifyUI();
@@ -1274,11 +1909,26 @@ class DownloadManager {
 		try {
 			await new Promise((resolve, reject) => {
 				const doRequest = (currentUrl, redirectCount = 0) => {
+					// 4. Better redirect handling: Prevent infinite redirect loops
 					if (redirectCount > 10) return reject(new Error('Too many redirects.'));
-					const parsedUrl = new URL(currentUrl);
-					const client = parsedUrl.protocol === 'https:' ? https : http;
+					
+					try {
+						// Re-validated on every hop, not just the initial URL — a redirect
+						// response is server-controlled, so it must clear the same https-only,
+						// trusted-host bar as the original request. This is what actually
+						// stops a compromised or malicious server from redirecting the
+						// download somewhere else entirely.
+						assertSafeDownloadUrl(currentUrl);
+					} catch (validationError) {
+						return reject(validationError);
+					}
+					const client = https; // http:// is blocked by assertSafeDownloadUrl above
+					let requestDestroyed = false;
 
-					const req = client.get(currentUrl, { headers: { 'User-Agent': 'GATE-Manager-Obsidian-Plugin' } }, (res) => {
+					const req = client.get(currentUrl, { 
+						headers: { 'User-Agent': 'GATE-Manager-Obsidian-Plugin' },
+						timeout: 15000 // 6. Improve timeout detection using native socket timeouts
+					}, (res) => {
 						if (this.abortController.signal.aborted) {
 							res.destroy();
 							const err = new Error('AbortError');
@@ -1286,9 +1936,11 @@ class DownloadManager {
 							return reject(err);
 						}
 
+						// 4. Better redirect handling: Resolve relative Location headers securely
 						if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
 							res.resume(); 
-							doRequest(res.headers.location, redirectCount + 1);
+							const redirectUrl = new URL(res.headers.location, currentUrl).href;
+							doRequest(redirectUrl, redirectCount + 1);
 							return;
 						}
 
@@ -1302,6 +1954,21 @@ class DownloadManager {
 
 						let lastTime = Date.now(), lastReceived = 0;
 						const writeStream = fs.createWriteStream(this.destPath);
+
+						// 5. Remove abort-listener leaks: Keep reference to handler for cleanup
+						const abortHandler = () => {
+							requestDestroyed = true;
+							req.destroy();
+							writeStream.destroy();
+							const err = new Error('AbortError');
+							err.name = 'AbortError';
+							reject(err);
+						};
+						this.abortController.signal.addEventListener('abort', abortHandler);
+
+						const cleanup = () => {
+							this.abortController.signal.removeEventListener('abort', abortHandler);
+						};
 
 						res.on('data', (chunk) => {
 							this.progress.received += chunk.length;
@@ -1318,21 +1985,61 @@ class DownloadManager {
 						});
 
 						res.pipe(writeStream);
-						writeStream.on('finish', () => writeStream.close((err) => err ? reject(err) : resolve()));
-						writeStream.on('error', (err) => { fs.unlink(this.destPath, () => {}); reject(err); });
+						
+						writeStream.on('finish', () => {
+							cleanup();
+							writeStream.close((err) => {
+								if (err) return reject(err);
+
+								// 7. Verify downloaded archive before reporting success & 8. Improve download integrity checks
+								try {
+									const stats = fs.statSync(this.destPath);
+									if (this.progress.total > 0 && stats.size !== this.progress.total) {
+										throw new Error(`Download integrity failed: Expected ${this.progress.total} bytes but received ${stats.size} bytes.`);
+									}
+									if (stats.size === 0) {
+										throw new Error("Download integrity failed: File is completely empty.");
+									}
+									resolve();
+								} catch (verificationError) {
+									reject(verificationError);
+								}
+							});
+						});
+
+						writeStream.on('error', (err) => {
+							cleanup();
+							if (!requestDestroyed) {
+								fs.unlink(this.destPath, () => {}); 
+								reject(err);
+							}
+						});
 					});
-					req.on('error', reject);
-					this.abortController.signal.addEventListener('abort', () => { req.destroy(); const err = new Error('AbortError'); err.name = 'AbortError'; reject(err); });
+					
+					// 6. Improve timeout detection handling
+					req.on('timeout', () => {
+						requestDestroyed = true;
+						req.destroy();
+						reject(new Error("Download timed out. No data received for 15 seconds. Please check your internet connection."));
+					});
+
+					req.on('error', (err) => {
+						if (!requestDestroyed) reject(err);
+					});
 				};
+				
 				doRequest(url);
 			});
 
 			this.state = 'completed';
 			this.plugin.notifyUI();
 		} catch (error) {
+			if (this.destPath && fs.existsSync(this.destPath)) {
+				try { fs.unlinkSync(this.destPath); } catch (e) {}
+			}
+
 			if (error.name === 'AbortError') {
 				this.state = 'cancelled';
-				if (this.destPath && fs.existsSync(this.destPath)) fs.unlinkSync(this.destPath);
 			} else {
 				this.state = 'failed';
 				this.error = error.message;
@@ -1341,7 +2048,9 @@ class DownloadManager {
 		}
 	}
 
-	cancel() { if (this.abortController) this.abortController.abort(); }
+	cancel() { 
+		if (this.abortController) this.abortController.abort(); 
+	}
 }
 
 class ExecutionResult {
@@ -1367,58 +2076,193 @@ class InstallationExecutor {
 	async execute(planningResult, selectedActionIds) {
 		this.resetState();
 		this.state = 'executing';
-		this.plugin.statusBarItemEl.setText("GATE: Installing...");
+		this.plugin.statusBarItemEl.setText("🔄 GATE: Installing...");
 		this.plugin.notifyUI();
+
+		this.result = new ExecutionResult();
+
+		// The install/update flow reads and rewrites plugin state (history, statistics,
+		// installedFiles) at the end of this run. If state hasn't finished loading yet
+		// (e.g. this ran before StateLoader.load() completed, or that load somehow left
+		// stateLoader.model unset), bail out now rather than doing file I/O we then can't
+		// safely record — StateModel itself is now defensive against bad *data*, but a
+		// completely missing model is a different failure the loop below shouldn't assume away.
+		if (!this.plugin.stateLoader || !this.plugin.stateLoader.model) {
+			this.state = 'failed';
+			this.result.success = false;
+			this.result.errors.push("Installation aborted: plugin state has not finished loading yet. Please wait a moment and try again.");
+			this.plugin.notifyUI();
+			return;
+		}
 
 		const vaultRoot = this.plugin.app.vault.adapter.getBasePath();
 		const archiveRoot = this.plugin.extractionManager.result.archiveRoot;
-		this.result = new ExecutionResult();
 		
-		const actionsToExecute = planningResult.installPlan.actions.filter(a => selectedActionIds.has(a.id));
-		this.progress.total = actionsToExecute.length;
+		const allActions = planningResult.installPlan.actions;
+		this.progress.total = allActions.filter(a => selectedActionIds.has(a.id)).length;
 		const installedFilesList = [];
 		let installedCount = 0;
 
+		const backupDir = path.join(this.plugin.tempManager.getCacheDir(), 'backups', Date.now().toString());
+		await fs.promises.mkdir(backupDir, { recursive: true });
+		const rollbackLog = [];
+
 		try {
-			for (const action of actionsToExecute) {
+			for (const action of allActions) {
 				const destPath = path.join(vaultRoot, action.path);
 				const srcPath = path.join(archiveRoot, action.path);
-				
-				try {
-					if ([ActionType.INSTALL, ActionType.UPDATE, ActionType.MERGE, ActionType.CONFLICT].includes(action.type)) {
-						const destDir = path.dirname(destPath);
-						if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
-						
-						if (fs.existsSync(srcPath)) {
-							fs.copyFileSync(srcPath, destPath);
-							const hash = await HashService.getFileHash(destPath);
-							installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
-							installedCount++;
-						} else {
-							this.result.errors.push(`Source file missing: ${action.path}`);
-						}
-					} else if (action.type === ActionType.ARCHIVE) {
-						if (fs.existsSync(destPath)) {
-							fs.renameSync(destPath, destPath + '.archive');
+
+				// Retain state for actions skipped by user selection
+				if (!selectedActionIds.has(action.id)) {
+					if (action.stateEntry) installedFilesList.push(action.stateEntry);
+					continue;
+				}
+
+				const destDir = path.dirname(destPath);
+				await fs.promises.mkdir(destDir, { recursive: true });
+
+				// Rollback tracking helper
+				const backupIfNeeded = async (target) => {
+					const exists = fs.existsSync(target);
+					let backupPath = null;
+					if (exists) {
+						const uid = Date.now().toString() + '-' + Math.floor(Math.random() * 1000000);
+						backupPath = path.join(backupDir, uid);
+						await fs.promises.copyFile(target, backupPath);
+					}
+					rollbackLog.push({ type: 'file', dest: target, existed: exists, backup: backupPath });
+				};
+
+				// Undo a single bad file write immediately (integrity/hash mismatch on one file
+				// shouldn't leave a corrupted file sitting in the vault just because the overall
+				// install loop didn't throw). Restores the pre-install backup if one exists,
+				// otherwise deletes the file we just created. Also removes the matching entry
+				// from rollbackLog so the catastrophic end-of-run rollback doesn't try to process
+				// an already-reverted entry a second time.
+				const revertFile = async (target) => {
+					for (let i = rollbackLog.length - 1; i >= 0; i--) {
+						const log = rollbackLog[i];
+						if (log.type === 'file' && log.dest === target) {
+							try {
+								if (log.existed && log.backup) {
+									await fs.promises.copyFile(log.backup, log.dest);
+								} else if (!log.existed && fs.existsSync(log.dest)) {
+									await fs.promises.unlink(log.dest);
+								}
+							} catch (revertErr) {
+								console.error(`[GATE Manager] Failed to revert bad file ${target}:`, revertErr);
+							}
+							rollbackLog.splice(i, 1);
+							return;
 						}
 					}
-				} catch (err) {
-					this.result.errors.push(`Failed to process ${action.path}: ${err.message}`);
+					// No matching backup entry found — still don't leave a corrupt file behind.
+					if (fs.existsSync(target)) {
+						try { await fs.promises.unlink(target); } catch (e) { console.error(`[GATE Manager] Failed to remove bad file ${target}:`, e); }
+					}
+				};
+
+				// Process actions
+				if (action.type === ActionType.SKIP || action.type === ActionType.IGNORE) {
+					if (action.stateEntry) installedFilesList.push(action.stateEntry);
+					this.progress.current++;
+					continue;
+				}
+
+				if (action.type === ActionType.ARCHIVE) {
+					if (fs.existsSync(destPath)) {
+						const uniqueId = Date.now().toString() + '-' + Math.floor(Math.random() * 1000000);
+						const archivePath = `${destPath}.${uniqueId}.archive`;
+						await fs.promises.rename(destPath, archivePath);
+						rollbackLog.push({ type: 'rename', from: archivePath, to: destPath });
+					}
+					this.progress.current++;
+					continue;
+				}
+
+				if (action.type === ActionType.INSTALL || action.type === ActionType.UPDATE) {
+					if (!fs.existsSync(srcPath)) {
+						this.result.errors.push(`Skipped ${action.path}: File missing or failed integrity check during extraction.`);
+						continue; // Soft Fail: Skip to the next file
+					}
+					
+					await backupIfNeeded(destPath);
+					await fs.promises.stat(srcPath);
+					await fs.promises.copyFile(srcPath, destPath);
+					
+					const hash = await HashService.getFileHash(destPath);
+					if (action.repositoryHash && hash !== action.repositoryHash) {
+						this.result.errors.push(`Integrity verification failed for ${action.path} after copying. Skipping.`);
+						await revertFile(destPath); // don't leave the corrupted copy in the vault
+						continue; // Soft Fail: Skip to the next file
+					}
+					installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
+					installedCount++;
+					
+				} else if (action.type === ActionType.CONFLICT) {
+					if (!fs.existsSync(srcPath)) {
+						this.result.errors.push(`Skipped conflict for ${action.path}: Incoming file missing.`);
+						continue;
+					}
+					const conflictDest = destPath + '.repo';
+					await backupIfNeeded(conflictDest);
+					await fs.promises.stat(srcPath);
+					await fs.promises.copyFile(srcPath, conflictDest);
+
+					if (action.stateEntry) installedFilesList.push(action.stateEntry);
+					installedCount++;
+					
+				} else if (action.type === ActionType.MERGE) {
+					const strategy = action.mergeStrategy || 'Ours';
+					if (strategy === 'Theirs') {
+						if (!fs.existsSync(srcPath)) {
+							this.result.errors.push(`Skipped merge for ${action.path}: Incoming file missing.`);
+							continue;
+						}
+						await backupIfNeeded(destPath);
+						await fs.promises.stat(srcPath);
+						await fs.promises.copyFile(srcPath, destPath);
+
+						const hash = await HashService.getFileHash(destPath);
+						if (action.repositoryHash && hash !== action.repositoryHash) {
+							this.result.errors.push(`Integrity verification failed for ${action.path} after merge. Skipping.`);
+							await revertFile(destPath); // don't leave the corrupted copy in the vault
+							continue;
+						}
+						installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
+						installedCount++;
+						
+					} else if (strategy === 'Append') {
+						if (!fs.existsSync(srcPath)) {
+							this.result.errors.push(`Skipped append for ${action.path}: Incoming file missing.`);
+							continue;
+						}
+						await backupIfNeeded(destPath);
+						await fs.promises.stat(srcPath);
+						const srcContent = await fs.promises.readFile(srcPath, 'utf8');
+						const prefix = fs.existsSync(destPath) ? '\n' : '';
+						await fs.promises.appendFile(destPath, prefix + srcContent);
+
+						const hash = await HashService.getFileHash(destPath);
+						installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
+						installedCount++;
+						
+					} else {
+						if (action.stateEntry) installedFilesList.push(action.stateEntry);
+					}
 				}
 				
 				this.progress.current++;
 				if (this.progress.current % 5 === 0) {
-					this.plugin.statusBarItemEl.setText(`GATE: Installing ${this.progress.current} / ${this.progress.total}`);
+					this.plugin.statusBarItemEl.setText(`🔄 GATE: Installing ${this.progress.current}/${this.progress.total}`);
 					this.plugin.notifyUI();
 				}
 			}
 			
-			const skippedActions = planningResult.installPlan.actions.filter(a => (a.type === ActionType.SKIP || a.type === ActionType.IGNORE || !selectedActionIds.has(a.id)) && a.stateEntry);
-			for (const action of skippedActions) {
-				installedFilesList.push(action.stateEntry);
-			}
-
-			const currentState = this.plugin.stateLoader.model;
+			// Only update state atomically after all file operations have succeeded without throwing
+			// Guard against the model going null mid-run too (e.g. a concurrent stateLoader.load()
+			// call resets it) — not just the upfront check before the loop started.
+			const currentState = this.plugin.stateLoader.model || {};
 			const history = Object.assign({}, currentState.history || {});
 			if (!history.firstInstall) history.firstInstall = Date.now();
 			history.lastInstall = Date.now();
@@ -1444,15 +2288,36 @@ class InstallationExecutor {
 			
 			await this.plugin.saveState(newState);
 			
-			this.result.success = this.result.errors.length === 0;
+			this.result.success = true;
 			this.result.installedFilesCount = installedCount;
 			this.state = 'completed';
 			
-			this.plugin.tempManager.cleanAll();
+			await this.plugin.tempManager.cleanAll();
 
 		} catch (error) {
+			// Trigger rollback on any file I/O or validation failure
+			for (let i = rollbackLog.length - 1; i >= 0; i--) {
+				const log = rollbackLog[i];
+				try {
+					if (log.type === 'rename') {
+						await fs.promises.rename(log.from, log.to);
+					} else if (log.type === 'file') {
+						if (log.existed && log.backup) {
+							await fs.promises.copyFile(log.backup, log.dest);
+						} else if (!log.existed) {
+							if (fs.existsSync(log.dest)) {
+								await fs.promises.unlink(log.dest);
+							}
+						}
+					}
+				} catch (rollbackErr) {
+					console.error("[GATE Manager] Rollback step failed:", rollbackErr);
+				}
+			}
+
 			this.state = 'failed';
-			this.result.errors.push(error.message);
+			this.result.success = false;
+			this.result.errors.push(error.message || "Installation failed and was safely rolled back.");
 		}
 		
 		this.plugin.notifyUI();
@@ -1467,18 +2332,15 @@ class FileDiffModal extends Modal {
 		this.vaultRoot = app.vault.adapter.getBasePath();
 	}
 
-	// Computes a line-by-line diff using a basic LCS/DP algorithm
 	computeDiffLines(oldStr, newStr) {
 		const oldLines = oldStr.split('\n');
 		const newLines = newStr.split('\n');
 		
-		// 1. Strip matching prefixes to speed up the matrix processing
 		let start = 0;
 		while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) {
 			start++;
 		}
 		
-		// 2. Strip matching suffixes
 		let endOld = oldLines.length - 1;
 		let endNew = newLines.length - 1;
 		while (endOld >= start && endNew >= start && oldLines[endOld] === newLines[endNew]) {
@@ -1491,12 +2353,11 @@ class FileDiffModal extends Modal {
 		
 		const diff = [];
 		
-		// Safety fallback for extremely large files to prevent UI thread freezes
-		if (midOld.length * midNew.length > 4000000) { 
+		// Fix: Limit 2D matrix size constraints aggressively (1 Million max elements approx) to stop OOM crashes
+		if (midOld.length * midNew.length > 1000000) { 
 			for (let o of midOld) diff.push({ type: 'remove', value: o });
 			for (let n of midNew) diff.push({ type: 'add', value: n });
 		} else {
-			// 3. Dynamic Programming LCS on the differing middle section
 			const dp = Array(midOld.length + 1).fill(0).map(() => Array(midNew.length + 1).fill(0));
 			for (let i = 1; i <= midOld.length; i++) {
 				for (let j = 1; j <= midNew.length; j++) {
@@ -1526,7 +2387,6 @@ class FileDiffModal extends Modal {
 			diff.push(...tempDiff);
 		}
 		
-		// 4. Assemble the final unified diff array
 		const result = [];
 		for (let k = 0; k < start; k++) result.push({ type: 'equal', value: oldLines[k] });
 		result.push(...diff);
@@ -1538,7 +2398,6 @@ class FileDiffModal extends Modal {
 	onOpen() {
 		const { contentEl, titleEl } = this;
 		
-		// Native-like Obsidian breadcrumb in the title
 		titleEl.empty();
 		const headerContainer = titleEl.createDiv({ attr: { style: 'display: flex; align-items: center; flex-wrap: wrap; gap: 4px;' } });
 		
@@ -1583,23 +2442,19 @@ class FileDiffModal extends Modal {
 
 		const diffLines = this.computeDiffLines(localContent, incomingContent);
 
-		// Diff Legend
 		const info = contentEl.createDiv({ attr: { style: 'display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 0.85em; color: var(--text-muted);' } });
 		info.createSpan({ text: '− Removed (Your Local File)' });
 		info.createSpan({ text: '+ Added (Incoming Repository)' });
 
-		// Diff Viewer Container
 		const diffViewer = contentEl.createDiv({ 
 			attr: { 
 				style: 'background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: 6px; padding: 10px; max-height: 60vh; overflow-y: auto; font-family: var(--font-monospace); font-size: 0.9em; line-height: 1.5; white-space: pre-wrap; word-break: break-word;' 
 			} 
 		});
 
-		// Render Lines
 		for (const line of diffLines) {
 			const lineEl = diffViewer.createDiv({ attr: { style: 'padding: 0 4px; border-radius: 3px; display: flex; gap: 10px;' } });
 			
-			// Using user-select: none on the marker so copying text doesn't grab +/- symbols
 			const marker = lineEl.createSpan({ attr: { style: 'width: 15px; flex-shrink: 0; user-select: none; opacity: 0.5; text-align: right;' } });
 			const text = lineEl.createSpan({ text: line.value || ' ', attr: { style: 'flex: 1;' } });
 
@@ -1640,20 +2495,21 @@ class InstallPlanReviewModal extends Modal {
 
 		for (const a of planningResult.installPlan.actions) {
 			if (a.type !== ActionType.SKIP && a.type !== ActionType.IGNORE) {
-				if (this.isExcluded(a.path)) {
-					this.excludedActions.push(a);
-				} else {
+				if (a.isMandatory || !this.isExcluded(a.path)) {
 					this.includedActions.push(a);
 					this.selectedActionIds.add(a.id);
+				} else {
+					this.excludedActions.push(a);
 				}
 			}
 		}
 	}
 
+	// Fix: Filter logic adjusted to match nested items and subfolders properly
 	isExcluded(p) {
 		const filters = (this.plugin.settings.exclusionFilter || "").split(',').map(s => s.trim()).filter(s => s.length > 0);
 		for (const f of filters) {
-			if (p === f || p.startsWith(f + '/')) {
+			if (p === f || p.startsWith(f + '/') || p.endsWith('/' + f) || p.includes('/' + f + '/')) {
 				return true;
 			}
 		}
@@ -1685,7 +2541,6 @@ class InstallPlanReviewModal extends Modal {
 			const details = container.createEl('details', { attr: { open: true, style: 'margin-left: 20px; width: 100%;' } });
 			const summary = details.createEl('summary', { attr: { style: 'cursor: pointer; font-weight: bold; padding: 4px 0; list-style-position: inside;' } });
 			
-			// Added class 'gate-folder-cb' to easily target folder checkboxes with the 'Select All' toggle
 			const folderCb = summary.createEl('input', { type: 'checkbox', cls: 'gate-folder-cb', attr: { style: 'margin-right: 8px;' } });
 			summary.createEl('span', { text: `📁 ${node.name}` });
 			
@@ -1699,9 +2554,11 @@ class InstallPlanReviewModal extends Modal {
 			folderCb.onchange = (e) => {
 				const isChecked = e.target.checked;
 				childActionIds.forEach(id => {
+					const cb = this.checkboxMap.get(id);
+					if (cb && cb.disabled) return; 
+
 					if (isChecked) this.selectedActionIds.add(id);
 					else this.selectedActionIds.delete(id);
-					const cb = this.checkboxMap.get(id);
 					if (cb) cb.checked = isChecked;
 				});
 			};
@@ -1723,24 +2580,32 @@ class InstallPlanReviewModal extends Modal {
 			cb.checked = this.selectedActionIds.has(a.id);
 			this.checkboxMap.set(a.id, cb);
 
-			cb.onchange = () => {
-				if (cb.checked) this.selectedActionIds.add(a.id);
-				else this.selectedActionIds.delete(a.id);
-			};
-
 			let typeColor = 'var(--text-normal)';
 			if (a.type === ActionType.INSTALL) typeColor = 'var(--text-success)';
 			else if (a.type === ActionType.UPDATE) typeColor = 'var(--text-accent)';
 			else if (a.type === ActionType.CONFLICT) typeColor = 'var(--text-error)';
 			else if (a.type === ActionType.ARCHIVE) typeColor = 'var(--text-warning)';
 
-			const label = row.createEl('span', { text: `📄 ${node.name} `, attr: { style: `font-family: var(--font-monospace); cursor: pointer; color: ${typeColor};` } });
-			label.createEl('small', { text: `[${a.type}]`, attr: { style: 'opacity: 0.6; margin-left: 5px;' } });
+			const label = row.createEl('span', { attr: { style: `font-family: var(--font-monospace); cursor: pointer; color: ${typeColor};` } });
 			
-			label.onclick = () => {
-				cb.checked = !cb.checked;
-				cb.onchange();
-			};
+			if (a.isMandatory) {
+				cb.checked = true;
+				cb.disabled = true;
+				label.innerHTML = `📄 ${node.name} 🔒 `;
+				label.style.cursor = 'default';
+			} else {
+				label.innerHTML = `📄 ${node.name} `;
+				cb.onchange = () => {
+					if (cb.checked) this.selectedActionIds.add(a.id);
+					else this.selectedActionIds.delete(a.id);
+				};
+				label.onclick = () => {
+					cb.checked = !cb.checked;
+					cb.onchange();
+				};
+			}
+
+			label.createEl('small', { text: `[${a.type}]`, attr: { style: 'opacity: 0.6; margin-left: 5px;' } });
 
 			if ([ActionType.UPDATE, ActionType.CONFLICT].includes(a.type)) {
 				const viewBtn = row.createEl('button', { text: '👁️ View', attr: { style: 'margin-left: auto; padding: 2px 8px; font-size: 0.8em; background: transparent; box-shadow: none;' } });
@@ -1756,19 +2621,16 @@ class InstallPlanReviewModal extends Modal {
 
 		const sectionDiv = parentContainer.createDiv({ attr: { style: 'margin-bottom: 25px;' } });
 
-		// Header Row (Flex)
 		const headerFlex = sectionDiv.createDiv({ attr: { style: 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 5px;' } });
 		
 		const headerTitle = headerFlex.createEl('h3', { text: title, attr: { style: 'margin: 0; color: ' + (isIncluded ? 'var(--text-normal)' : 'var(--text-muted)') } });
 		
 		const controlsDiv = headerFlex.createDiv({ attr: { style: 'display: flex; gap: 20px; align-items: center;' } });
-		const { ToggleComponent } = require('obsidian');
 
-		// Expand/Collapse All Toggle
 		const expandAllDiv = controlsDiv.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
 		expandAllDiv.createEl('span', { text: 'Expand All', cls: 'text-muted', attr: { style: 'font-size: 0.9em; user-select: none;' } });
 		new ToggleComponent(expandAllDiv)
-			.setValue(true) // Tree is expanded by default
+			.setValue(true) 
 			.onChange((value) => {
 				const details = treeContainer.querySelectorAll('details');
 				details.forEach(d => {
@@ -1777,27 +2639,27 @@ class InstallPlanReviewModal extends Modal {
 				});
 			});
 
-		// Select/Deselect All Toggle
 		const selectAllDiv = controlsDiv.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
 		selectAllDiv.createEl('span', { text: 'Select All', cls: 'text-muted', attr: { style: 'font-size: 0.9em; user-select: none;' } });
 		new ToggleComponent(selectAllDiv)
-			.setValue(isIncluded) // Included true by default, Excluded false by default
+			.setValue(isIncluded) 
 			.onChange((value) => {
-				// Update tracking state and leaf checkboxes
 				actions.forEach(a => {
+					if (a.isMandatory) {
+						this.selectedActionIds.add(a.id);
+						return;
+					}
 					if (value) this.selectedActionIds.add(a.id);
 					else this.selectedActionIds.delete(a.id);
 					
 					const cb = this.checkboxMap.get(a.id);
-					if (cb) cb.checked = value;
+					if (cb && !cb.disabled) cb.checked = value;
 				});
 				
-				// Update all folder checkboxes inside this specific section
 				const folderCbs = treeContainer.querySelectorAll('.gate-folder-cb');
 				folderCbs.forEach(cb => cb.checked = value);
 			});
 
-		// Tree Container
 		const treeContainer = sectionDiv.createDiv();
 		const tree = this.buildTree(actions);
 		for (const childName of Object.keys(tree.children).sort()) {
@@ -1943,13 +2805,12 @@ class GateManagerView extends ItemView {
 		const container = this.contentEl;
 		container.empty();
 		
-		// Use a max-width wrapper so it looks good on wide screens
 		this.mainContainer = container.createDiv({ 
 			attr: { style: 'max-width: 800px; margin: 0 auto; padding: 2rem 1rem;' } 
 		});
 
 		const loadingEl = this.mainContainer.createEl('p', { text: 'Connecting to repository...' });
-		await this.plugin.gitHubService.refreshReleaseData(true);
+		await this.plugin.checkForUpdates(true, true);
 		loadingEl.remove();
 
 		this.renderContent(this.mainContainer);
@@ -2028,11 +2889,10 @@ class GateManagerView extends ItemView {
 		};
 
 		addLinkBtn('GitHub Repo', `https://github.com/${this.plugin.settings.repositoryOwner}/${this.plugin.settings.repositoryName}`);
-		addLinkBtn('Join Broadcast Channel', 'https://aratt.ai/@gate');
+		addLinkBtn('Join YouTube Channel', 'https://www.youtube.com/@zettelforgate');
+		addLinkBtn('Join Telegram Channel', 'https://t.me/gate_ee0');
 		addLinkBtn('Email', 'mailto:zettelforgate@gmail.com');
 		addLinkBtn('Support the Creator', 'https://razorpay.me/@anandbaghel', true);
-		addLinkBtn('Join Private Group Chat (only Supporters)', 'https://chat.arattai.in/groups/r43545f313436363135373638323731353339343239325f333333363938382d47437c3031303032313133333230353137383335393037363537363530', false);
-
 	}
 
 	renderActionsContainer() {
@@ -2113,13 +2973,26 @@ class GateManagerView extends ItemView {
 				})
 			);
 
-			actionBlock.addButton(btn => btn
-				.setButtonText('Refresh Check')
-				.onClick(async () => {
-					await this.plugin.checkForUpdates(false);
-					this.renderActionsContainer();
-				})
-			);
+			if (dm.state === 'failed' || em.state === 'failed' || vsm.state === 'failed' || (vm && vm.state === 'failed')) {
+				actionBlock.addButton(btn => btn
+					.setButtonText('Clear Cache')
+					.setWarning() 
+					.onClick(async () => {
+						await this.plugin.tempManager.cleanAll();
+						this.plugin.resetAllManagers();
+						this.renderActionsContainer();
+						this.plugin.showNotice("Cache cleared.");
+					})
+				);
+			} else {
+				actionBlock.addButton(btn => btn
+					.setButtonText('Refresh Check')
+					.onClick(async () => {
+						await this.plugin.checkForUpdates(false, true);
+						this.renderActionsContainer();
+					})
+				);
+			}
 		}
 	}
 
@@ -2162,14 +3035,15 @@ class GateManagerView extends ItemView {
 		if (dm.state === 'downloading') {
 			this.progressUI.setting.setName("Downloading Archive...");
 			const downloadedStr = FormatUtils.bytes(dm.progress.received);
+			
 			if (dm.progress.total > 0) {
 				this.progressUI.progressEl.removeAttribute('aria-busy');
 				this.progressUI.progressEl.value = dm.progress.percent;
 				const totalStr = FormatUtils.bytes(dm.progress.total);
 				this.progressUI.statsEl.textContent = `Downloaded: ${downloadedStr} / ${totalStr} (${dm.progress.percent}%)`;
 			} else {
-				this.progressUI.progressEl.removeAttribute('value'); 
-				this.progressUI.statsEl.textContent = `Downloaded: ${downloadedStr} (Total size unknown)`;
+				this.progressUI.progressEl.removeAttribute('value'); // Makes progress bar an endless spinner
+				this.progressUI.statsEl.textContent = `Downloading... ${downloadedStr} received`;
 			}
 		} else if (em.state === 'extracting') {
 			this.progressUI.setting.setName("Extracting Archive...");
@@ -2224,8 +3098,14 @@ class GateManagerView extends ItemView {
 		
 		if (result.success) {
 			summary.append(createEl("span", { text: `Successfully installed/updated ${result.installedFilesCount} files.`, cls: 'gate-manager-success-text' }), createEl("br"));
+			
+			// If the installation succeeded but files were skipped (Soft Fail)
+			if (result.errors && result.errors.length > 0) {
+				summary.append(createEl("br"));
+				summary.append(createEl("span", { text: `⚠️ Warning: ${result.errors.length} file(s) were skipped due to formatting/integrity mismatches. The rest of your vault was installed successfully.`, attr: { style: 'color: var(--text-warning); font-size: 0.9em;' } }), createEl("br"));
+			}
 		} else {
-			summary.append(createEl("span", { text: `Completed with ${result.errors.length} errors.`, attr: { style: 'color: var(--text-warning);' } }), createEl("br"));
+			summary.append(createEl("span", { text: `Completed with ${result.errors.length} critical errors.`, attr: { style: 'color: var(--text-error);' } }), createEl("br"));
 		}
 		
 		setting.setDesc(summary);
@@ -2255,38 +3135,31 @@ class GateManagerView extends ItemView {
 	}
 
 	renderPlanningReadyPanel(result) {
-		// 1. Create a styled native-looking card container
 		const wrapper = this.actionsContainerEl.createDiv({ 
 			attr: { style: 'border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 1.5rem; background: var(--background-secondary); margin-bottom: 1.5rem;' } 
 		});
 
-		// Fetch and format the total uncompressed size of the incoming vault
 		const totalSizeBytes = this.plugin.extractionManager.result.totalBytes || 0;
 		const formattedSize = FormatUtils.bytes(totalSizeBytes);
 
-		// 2. Header with title, size, and execution duration
 		const headerFlex = wrapper.createDiv({ attr: { style: 'display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 10px; margin-bottom: 15px;' } });
 		headerFlex.createEl('h3', { text: 'Installation Plan Ready', attr: { style: 'margin: 0;' } });
 		headerFlex.createEl('span', { text: `${formattedSize} • Computed in ${result.planningDuration}ms`, cls: 'text-muted', attr: { style: 'font-size: 0.85em; font-variant-numeric: tabular-nums;' } });
 
-		// 3. Plugin Dependencies Warning (Styled like a native Obsidian Callout)
 		if (result.repositoryModel.dependencies && result.repositoryModel.dependencies.plugins && result.repositoryModel.dependencies.plugins.length > 0) {
 			const depBox = wrapper.createDiv({ attr: { style: 'background: rgba(var(--color-accent-rgb), 0.1); border-left: 4px solid var(--color-accent); padding: 10px 15px; border-radius: 4px; margin-bottom: 15px;' } });
 			depBox.createEl('span', { text: 'Requires Plugins: ', attr: { style: 'font-weight: 600;' } });
 			depBox.createEl('span', { text: result.repositoryModel.dependencies.plugins.join(', '), attr: { style: 'color: var(--text-accent);' } });
 		}
 
-		// 4. General Warnings (Styled like a native Warning Callout)
 		if (result.warnings.length > 0) {
 			const warnBox = wrapper.createDiv({ attr: { style: 'background: rgba(var(--color-yellow-rgb, 255, 153, 0), 0.1); border-left: 4px solid var(--color-yellow, #ff9900); padding: 10px 15px; border-radius: 4px; margin-bottom: 15px;' } });
 			warnBox.createEl('span', { text: `Warnings (${result.warnings.length}): `, attr: { style: 'font-weight: 600; color: var(--text-warning);' } });
 			warnBox.createEl('span', { text: 'Check the developer console (Ctrl+Shift+I) for detailed logs.', cls: 'text-muted' });
 		}
 
-		// 5. Grid Layout for Statistics
 		const grid = wrapper.createDiv({ attr: { style: 'display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 25px;' } });
 
-		// Helper function to create clean key-value rows
 		const addStatRow = (container, label, value, activeColor = null) => {
 			const row = container.createDiv({ attr: { style: 'display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--background-modifier-border-hover); font-size: 0.9em;' } });
 			row.createSpan({ text: label, cls: 'text-muted' });
@@ -2296,14 +3169,12 @@ class GateManagerView extends ItemView {
 			}
 		};
 
-		// Column 1: General Overview
 		const col1 = grid.createDiv();
 		col1.createEl('h4', { text: 'Overview', attr: { style: 'margin-top: 0; margin-bottom: 10px; font-size: 1em; color: var(--text-normal);' } });
 		addStatRow(col1, 'Repository Files', result.summary.RepositoryFiles);
 		addStatRow(col1, 'Managed Files', result.summary.ManagedFiles);
 		addStatRow(col1, 'Generated Actions', result.summary.TotalActions);
 
-		// Column 2: Destructive / Additive Changes (Color-coded)
 		const col2 = grid.createDiv();
 		col2.createEl('h4', { text: 'Changes', attr: { style: 'margin-top: 0; margin-bottom: 10px; font-size: 1em; color: var(--text-normal);' } });
 		addStatRow(col2, 'Install', result.summary.InstallCount, 'var(--text-success)');
@@ -2311,14 +3182,12 @@ class GateManagerView extends ItemView {
 		addStatRow(col2, 'Archive', result.summary.ArchiveCount, 'var(--text-warning)');
 		addStatRow(col2, 'Conflict', result.summary.ConflictCount, 'var(--text-error)');
 
-		// Column 3: Skipped / Ignored (Neutral)
 		const col3 = grid.createDiv();
 		col3.createEl('h4', { text: 'Unchanged', attr: { style: 'margin-top: 0; margin-bottom: 10px; font-size: 1em; color: var(--text-normal);' } });
 		addStatRow(col3, 'Skip', result.summary.SkipCount);
 		addStatRow(col3, 'Ignore', result.summary.IgnoreCount);
 		addStatRow(col3, 'Merge', result.summary.MergeCount);
 
-		// 6. Action Settings Block
 		const actionSetting = new Setting(this.actionsContainerEl)
 			.setName('Ready to Install')
 			.setDesc('Review the detailed plan and select specific files to include or exclude before overwriting.');
@@ -2331,6 +3200,7 @@ class GateManagerView extends ItemView {
 		actionSetting.addButton(btn => btn.setButtonText('Review & Install').setCta().onClick(() => {
 			new InstallPlanReviewModal(this.app, this.plugin, result, async (selectedActionIds) => {
 				await this.plugin.installationExecutor.execute(result, selectedActionIds);
+				this.plugin.postInstallRoutine(result.repositoryModel); 
 			}).open();
 		}));
 	}
@@ -2409,6 +3279,12 @@ class GateManagerView extends ItemView {
 		
 		setting.setDesc(summary);
 
+		setting.addButton(btn => btn.setButtonText('Clear Cache').setWarning().onClick(async () => {
+			await this.plugin.tempManager.cleanAll();
+			this.plugin.resetAllManagers();
+			this.plugin.notifyUI();
+			this.plugin.showNotice("Cache cleared.");
+		}));
 		setting.addButton(btn => btn.setButtonText('Retry Download').setCta().onClick(() => {
 			this.plugin.startVaultDownload();
 		}));
@@ -2425,6 +3301,12 @@ class GateManagerView extends ItemView {
 		emResult.errors.forEach(err => errList.append("- ", err, createEl("br")));
 		setting.setDesc(errList);
 
+		setting.addButton(btn => btn.setButtonText('Clear Cache').setWarning().onClick(async () => {
+			await this.plugin.tempManager.cleanAll();
+			this.plugin.resetAllManagers();
+			this.plugin.notifyUI();
+			this.plugin.showNotice("Cache cleared.");
+		}));
 		setting.addButton(btn => btn.setButtonText('Retry Download').setCta().onClick(() => {
 			this.plugin.startVaultDownload();
 		}));
@@ -2441,6 +3323,12 @@ class GateManagerView extends ItemView {
 		vm.errors.forEach(err => errList.append("- ", err, createEl("br")));
 		setting.setDesc(errList);
 
+		setting.addButton(btn => btn.setButtonText('Clear Cache').setWarning().onClick(async () => {
+			await this.plugin.tempManager.cleanAll();
+			this.plugin.resetAllManagers();
+			this.plugin.notifyUI();
+			this.plugin.showNotice("Cache cleared.");
+		}));
 		setting.addButton(btn => btn.setButtonText('Retry Download').setCta().onClick(() => {
 			this.plugin.startVaultDownload();
 		}));
@@ -2470,7 +3358,7 @@ class GateManagerPlugin extends Plugin {
 		this.installationExecutor = new InstallationExecutor(this);
 
 		this.uiRefreshCallbacks = [];
-		this.statusBarItemEl = this.addStatusBarItem();
+		this.setupStatusBar();
 		
 		this._lastNoticeTime = 0;
 		this._lastNoticeMsg = "";
@@ -2488,10 +3376,21 @@ class GateManagerPlugin extends Plugin {
 		}
 
 		this.showNotice("GATE Manager loaded");
-		this.updateStatusBar();
+		
+		// Event listener to toggle status bar visibility based on active view
+		this.registerEvent(this.app.workspace.on('layout-change', () => this.updateStatusBarVisibility()));
+		this.app.workspace.onLayoutReady(() => {
+			this.updateStatusBarVisibility();
+			this.updateStatusBar();
+		});
 
-		if (this.settings.autoCheckUpdates) {
-			this.checkForUpdates(true);
+		// Automatic background checks are only run when a GitHub token is configured.
+		// Without a token, every user shares GitHub's 60 req/hr *per network IP* limit, so
+		// silently auto-checking on every launch (across 10,000+ installs, many behind the
+		// same office/school/VPN IP) can exhaust that budget for everyone on that network.
+		// With a token, checks are billed against that user's own 5,000 req/hr quota instead.
+		if (this.settings.autoCheckUpdates && this.gitHubService.isAuthenticated()) {
+			this.checkForUpdates(true, false); // silent = true, isUserInitiated = false
 		}
 
 		this.addRibbonIcon('library', 'GATE Manager', () => this.openManager());
@@ -2509,6 +3408,34 @@ class GateManagerPlugin extends Plugin {
 		for (const cb of this.uiRefreshCallbacks) cb();
 	}
 
+	setupStatusBar() {
+		this.statusBarItemEl = this.addStatusBarItem();
+		this.statusBarItemEl.style.cursor = 'pointer';
+		this.statusBarItemEl.style.display = 'none'; // Hidden by default until layout is ready and checked
+		
+		// Allows clicking the status bar to cancel downloads or open the dashboard
+		this.statusBarItemEl.addEventListener('click', () => {
+			if (this.downloadManager.state === 'downloading') {
+				if (confirm("Do you want to cancel the vault download?")) {
+					this.downloadManager.cancel();
+					this.showNotice("Download canceled.");
+				}
+			} else {
+				this.openManager();
+			}
+		});
+	}
+
+	updateStatusBarVisibility() {
+		if (!this.statusBarItemEl) return;
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_GATE_MANAGER);
+		if (leaves.length > 0) {
+			this.statusBarItemEl.style.display = '';
+		} else {
+			this.statusBarItemEl.style.display = 'none';
+		}
+	}
+
 	updateStatusBar() {
 		if (!this.statusBarItemEl) return;
 		const dm = this.downloadManager;
@@ -2521,45 +3448,48 @@ class GateManagerPlugin extends Plugin {
 		const exec = this.installationExecutor;
 		
 		if (dm.state === 'downloading') {
-			this.statusBarItemEl.setText(dm.progress.total > 0 ? `GATE: Downloading ${dm.progress.percent}%` : `GATE: Downloading...`);
+			this.statusBarItemEl.setText(dm.progress.total > 0 ? `🔄 GATE: Downloading ${dm.progress.percent}%` : `🔄 GATE: Downloading...`);
 		} else if (em.state === 'extracting') {
-			this.statusBarItemEl.setText(`GATE: Extracting ${em.progress.extractedEntries} / ${em.progress.totalEntries}`);
+			this.statusBarItemEl.setText(`🔄 GATE: Extracting ${em.progress.extractedEntries}/${em.progress.totalEntries}`);
 		} else if (em.state === 'verifying') {
-			this.statusBarItemEl.setText(`GATE: Verifying Extraction...`);
+			this.statusBarItemEl.setText(`⏳ GATE: Verifying Extraction...`);
 		} else if (rml.state === 'loading') {
-			this.statusBarItemEl.setText(`GATE: Loading Repository...`);
+			this.statusBarItemEl.setText(`⏳ GATE: Loading Repository...`);
 		} else if (rml.state === 'validating') {
-			this.statusBarItemEl.setText(`GATE: Validating Repository...`);
+			this.statusBarItemEl.setText(`⏳ GATE: Validating Repository...`);
 		} else if (vsm.state === 'scanning') {
-			this.statusBarItemEl.setText(`GATE: Scanning Vault...`);
+			this.statusBarItemEl.setText(`🔄 GATE: Scanning Vault...`);
 		} else if (sl.state === 'loading') {
-			this.statusBarItemEl.setText(`GATE: Loading Plugin State...`);
+			this.statusBarItemEl.setText(`⏳ GATE: Loading Plugin State...`);
 		} else if (pl.state === 'planning') {
-			this.statusBarItemEl.setText(`GATE: Planning Installation...`);
+			this.statusBarItemEl.setText(`⏳ GATE: Planning Installation...`);
 		} else if (exec.state === 'executing') {
-			this.statusBarItemEl.setText(`GATE: Installing...`);
+			this.statusBarItemEl.setText(`🔄 GATE: Installing...`);
 		} else if (exec.state === 'completed') {
-			this.statusBarItemEl.setText(`GATE: Installation Complete`);
+			this.statusBarItemEl.setText(`✅ GATE: Installation Complete`);
 		} else if (exec.state === 'failed') {
-			this.statusBarItemEl.setText(`GATE: Installation Failed`);
+			this.statusBarItemEl.setText(`❌ GATE: Installation Failed`);
 		} else if (pl.state === 'completed' && pl.result && pl.result.isValid) {
-			this.statusBarItemEl.setText(`GATE: Plan Ready`);
+			this.statusBarItemEl.setText(`✅ GATE: Plan Ready`);
 		} else if (pl.state === 'failed' || (pl.result && !pl.result.isValid)) {
-			this.statusBarItemEl.setText(`GATE: Planning Failed`);
+			this.statusBarItemEl.setText(`❌ GATE: Planning Failed`);
 		} else if (sl.state === 'failed' || (sl.model && !sl.model.isValid)) {
-			this.statusBarItemEl.setText(`GATE: State Invalid`);
+			this.statusBarItemEl.setText(`❌ GATE: State Invalid`);
 		} else if (vsm.state === 'failed') {
-			this.statusBarItemEl.setText(`GATE: Vault Scan Failed`);
+			this.statusBarItemEl.setText(`❌ GATE: Vault Scan Failed`);
 		} else if (rml.state === 'completed' && !rml.model.isValid) {
-			this.statusBarItemEl.setText(`GATE: Repository Invalid`);
+			this.statusBarItemEl.setText(`❌ GATE: Repository Invalid`);
 		} else if (em.state === 'failed') {
-			this.statusBarItemEl.setText(`GATE: Extraction Failed`);
+			this.statusBarItemEl.setText(`❌ GATE: Extraction Failed`);
 		} else if (dm.state === 'completed' && (!vm || vm.state === 'pending')) {
-			this.statusBarItemEl.setText(`GATE: Download Complete`);
+			this.statusBarItemEl.setText(`✅ GATE: Download Complete`);
 		} else if (vm && vm.state !== 'pending' && em.state === 'idle') {
-			this.statusBarItemEl.setText(vm.state === 'verified' ? "GATE: Archive Verified" : "GATE: Verification Failed");
+			this.statusBarItemEl.setText(vm.state === 'verified' ? "✅ GATE: Archive Verified" : "❌ GATE: Verification Failed");
 		} else {
-			this.statusBarItemEl.setText(`GATE: ${this.vaultStatus.statusText}`);
+			const text = this.vaultStatus.statusText;
+			if (text === "Update Available") this.statusBarItemEl.setText(`🔄 GATE: ${text}`);
+			else if (text === "Offline" || text.includes("Error")) this.statusBarItemEl.setText(`❌ GATE: ${text}`);
+			else this.statusBarItemEl.setText(`✅ GATE: ${text}`);
 		}
 	}
 
@@ -2583,7 +3513,7 @@ class GateManagerPlugin extends Plugin {
 				}
 			}
 		});
-		this.addCommand({ id: 'check-vault-updates', name: 'Check for Vault Updates', callback: () => this.checkForUpdates(false) });
+		this.addCommand({ id: 'check-vault-updates', name: 'Check for Vault Updates', callback: () => this.checkForUpdates(false, true) });
 	}
 
 	resetAllManagers() {
@@ -2597,9 +3527,34 @@ class GateManagerPlugin extends Plugin {
 		this.installationExecutor.resetState();
 	}
 
+	async checkDiskSpace() {
+		try {
+			if (fs.promises && fs.promises.statfs) {
+				const vaultRoot = this.app.vault.adapter.getBasePath();
+				const stats = await fs.promises.statfs(vaultRoot);
+				const freeBytes = stats.bavail * stats.bsize;
+				// Require at least 1 GB (1024 * 1024 * 1024) of free space for safety
+				const MIN_BYTES = 1073741824; 
+				if (freeBytes < MIN_BYTES) {
+					return { hasSpace: false, freeStr: FormatUtils.bytes(freeBytes) };
+				}
+			}
+		} catch (e) {
+			// Fail silently if statfs is not supported on the user's OS/Node version
+		}
+		return { hasSpace: true };
+	}
+
 	async startVaultDownload() {
 		if (!this.vaultStatus.downloadUrl) {
 			this.showNotice("No downloadable archive found.");
+			return;
+		}
+
+		// DISK SPACE GUARD
+		const spaceCheck = await this.checkDiskSpace();
+		if (!spaceCheck.hasSpace) {
+			this.showNotice(`Not enough disk space! Only ${spaceCheck.freeStr} available. Please free up at least 1 GB to update the GATE vault safely.`);
 			return;
 		}
 		
@@ -2635,21 +3590,69 @@ class GateManagerPlugin extends Plugin {
 		}
 	}
 
-	async checkForUpdates(silent = false) {
+	async postInstallRoutine(repoModel) {
+		if (this.installationExecutor.state !== 'completed' || !this.installationExecutor.result.success) return;
+		
+		if (this.settings.autoOpenChangelog && repoModel && repoModel.manifest && repoModel.manifest.changelog) {
+			const changelogPath = repoModel.manifest.changelog;
+			const file = this.app.vault.getAbstractFileByPath(changelogPath);
+			if (file && file instanceof TFile) {
+				await this.app.workspace.getLeaf('tab').openFile(file);
+			}
+		}
+	}
+
+	async checkForUpdates(silent = false, isUserInitiated = false) {
+		const now = Date.now();
+
+		// The cooldown now applies to every caller (manual clicks, startup auto-check, and
+		// settings-triggered rechecks alike) — not just user-initiated ones. Previously only
+		// user-initiated checks were throttled, which meant the automatic startup check and
+		// the settings-save recheck could hit GitHub's API on every Obsidian launch / every
+		// settings tweak with no persisted memory of the last call. On a shared network IP
+		// (office, school, VPN) that unauthenticated 60/hr budget is shared by every GATE
+		// Manager user on that network, so unthrottled auto-checks could exhaust it quickly.
+		//
+		// Authenticated (token present) checks use a shorter cooldown since they draw from
+		// that user's own 5,000/hr quota instead of the shared unauthenticated one.
+		if (!DEV_MODE) {
+			const cooldownMs = this.gitHubService.getCooldownMs();
+			const timeSinceLastCheck = now - (this.settings.lastUpdateCheckTime || 0);
+			if (timeSinceLastCheck < cooldownMs) {
+				const minutesLeft = Math.ceil((cooldownMs - timeSinceLastCheck) / 60000);
+				if (!silent) this.showNotice(`Rate limit: Please wait ${minutesLeft} minute(s) before checking for updates again.`);
+				return;
+			}
+		}
+
 		if (!silent) this.showNotice("Checking for updates...");
-		if (this.statusBarItemEl) this.statusBarItemEl.setText("GATE: Checking...");
+		if (this.statusBarItemEl) this.statusBarItemEl.setText("⏳ GATE: Checking...");
 		
 		await this.gitHubService.refreshReleaseData(true);
 		this.updateStatusBar();
 
-		if (this.vaultStatus.connectionStatus !== "Connected") {
+		// Only start the cooldown when the check actually succeeded, or when GitHub itself
+		// told us we're rate-limited. Previously this was recorded unconditionally right
+		// after refreshReleaseData(), so a transient network blip, a misconfigured repo name,
+		// or an invalid token would ALSO suppress the next check for a full cooldown window —
+		// even though nothing meaningful was consumed from the rate-limit budget in those cases.
+		// A user fixing a typo'd repo name or a bad token would then have to wait up to an hour
+		// just to find out whether the fix worked.
+		const succeeded = this.vaultStatus.connectionStatus === "Connected";
+		const genuinelyRateLimited = typeof this.vaultStatus.connectionStatus === 'string' && this.vaultStatus.connectionStatus.startsWith('Rate limited');
+		if (!DEV_MODE && (succeeded || genuinelyRateLimited)) {
+			this.settings.lastUpdateCheckTime = now;
+			await this._persistSettings();
+		}
+
+		if (!succeeded) {
 			if (!silent) this.showNotice(`Update check failed: ${this.vaultStatus.connectionStatus}`);
 			return;
 		}
-
+		
 		const isUpdateAvailable = VersionUtils.compareVersions(this.vaultStatus.latestVersion, this.vaultStatus.installedVersion) > 0;
-		if (isUpdateAvailable && !silent) {
-			this.showNotice(`New version available: ${this.vaultStatus.latestVersion}`);
+		if (isUpdateAvailable) {
+			this.showNotice(`New GATE Vault version ${this.vaultStatus.latestVersion} available!`);
 		} else if (!silent) {
 			this.showNotice("Already up to date.");
 		}
@@ -2694,22 +3697,106 @@ class GateManagerPlugin extends Plugin {
 
 	async loadSettings() {
 		try {
-			const loadedData = await this.loadData();
-			this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
+			// Fix: Isolate settings data to a specific key space to avoid collisions with state
+			const loadedData = await this.loadData() || {};
+			const settingsData = loadedData.settings ? loadedData.settings : loadedData;
+			this.settings = Object.assign({}, DEFAULT_SETTINGS, settingsData);
+
+			// If the token was stored encrypted, decrypt it into memory for runtime use.
+			// safeStorage keys are tied to the OS user profile and are NOT portable across
+			// machines or accounts, so a failed decrypt here most likely means the vault
+			// (and its data.json) was copied/synced to a different computer or user — in that
+			// case we clear the unusable token and ask the user to re-enter it, rather than
+			// silently sending a garbage Authorization header to GitHub.
+			if (this.settings.githubTokenEncrypted) {
+				const decrypted = TokenCrypto.decrypt(this.settings.githubTokenEncrypted);
+				if (decrypted) {
+					this.settings.githubToken = decrypted;
+				} else {
+					this.settings.githubToken = '';
+					this.settings.githubTokenEncrypted = '';
+					if (this.settings.autoCheckUpdates) {
+						this.settings.autoCheckUpdates = false; // no longer eligible without a working token
+					}
+					new Notice("GATE Manager: Your saved GitHub token couldn't be decrypted (often happens after moving to a different computer/account). Please re-enter it in Advanced Settings.");
+				}
+			}
 		} catch (error) {
 			this.settings = Object.assign({}, DEFAULT_SETTINGS);
 			new Notice("GATE Manager: Failed to load settings. Using defaults.");
 		}
+		// Snapshot of the fields that actually affect WHICH data GitHub returns. Only a change
+		// to one of these should ever justify nulling the cache and re-checking for updates.
+		this._lastRepoConfigSnapshot = this._repoConfigSnapshot();
 	}
 
-	async saveSettings() {
+	_repoConfigSnapshot() {
+		return {
+			repositoryOwner: this.settings.repositoryOwner,
+			repositoryName: this.settings.repositoryName,
+			releaseChannel: this.settings.releaseChannel,
+			githubToken: this.settings.githubToken
+		};
+	}
+
+	// Builds the object actually written to data.json: encrypts the token via TokenCrypto
+	// (OS-level secret storage) when available, so the plain-text token never touches disk;
+	// falls back to writing it in plain text — same as the rest of data.json — when
+	// encryption isn't available on this platform. `this.settings.githubToken` itself is
+	// left untouched (still plain text in memory) for use by GitHubService at runtime.
+	_settingsForDisk() {
+		const toSave = Object.assign({}, this.settings);
+		if (toSave.githubToken) {
+			const encrypted = TokenCrypto.encrypt(toSave.githubToken);
+			if (encrypted) {
+				toSave.githubTokenEncrypted = encrypted;
+				toSave.githubToken = ''; // don't duplicate the secret in plain text when we can encrypt it
+			} else {
+				toSave.githubTokenEncrypted = ''; // encryption unavailable — plain text is the only option here
+			}
+		} else {
+			toSave.githubTokenEncrypted = '';
+		}
+		return toSave;
+	}
+
+	// Internal, silent persistence — no "Settings saved" notice, no recheck side-effects.
+	// Used for bookkeeping fields (like lastUpdateCheckTime) that don't reflect a user
+	// editing the settings tab and shouldn't trigger the settings-tab behavior below.
+	async _persistSettings() {
 		try {
 			const existingData = await this.loadData() || {};
-			const mergedData = Object.assign({}, existingData, this.settings);
-			await this.saveData(mergedData);
+			existingData.settings = this._settingsForDisk();
+			await this.saveData(existingData);
+		} catch (error) {
+			console.error("[GATE Manager] Failed to persist settings", error);
+		}
+	}
+
+	// Called from the settings tab whenever the user changes something. Only clears the
+	// GitHub cache and triggers a recheck if a field that actually changes the API request
+	// (owner/name/channel/token) was modified — previously this fired unconditionally on
+	// *every* settings change (including unrelated toggles like "Enable Notifications"),
+	// which meant idly clicking through settings could burn through the rate-limit budget.
+	async saveSettings() {
+		try {
+			const newSnapshot = this._repoConfigSnapshot();
+			const previousSnapshot = this._lastRepoConfigSnapshot || {};
+			const repoConfigChanged = Object.keys(newSnapshot).some(
+				key => newSnapshot[key] !== previousSnapshot[key]
+			);
+
+			const existingData = await this.loadData() || {};
+			existingData.settings = this._settingsForDisk();
+			await this.saveData(existingData);
 			this.showNotice("Settings saved");
-			this.gitHubService.cache = null; 
-			this.checkForUpdates(true); 
+
+			if (repoConfigChanged) {
+				this.gitHubService.cache = null;
+				this.checkForUpdates(true, false); // still subject to the cooldown gate above
+			}
+
+			this._lastRepoConfigSnapshot = newSnapshot;
 		} catch (error) {
 			new Notice("GATE Manager: Failed to save settings.");
 		}
@@ -2717,9 +3804,10 @@ class GateManagerPlugin extends Plugin {
 
 	async saveState(stateData) {
 		try {
+			// Fix: Properly map to independent state node
 			const existingData = await this.loadData() || {};
-			const mergedData = Object.assign({}, existingData, stateData);
-			await this.saveData(mergedData);
+			existingData.state = stateData;
+			await this.saveData(existingData);
 			await this.stateLoader.load();
 		} catch (error) {
 			console.error("[GATE Manager] Failed to save state", error);
@@ -2756,16 +3844,25 @@ class GateManagerSettingTab extends PluginSettingTab {
 			.addButton(btn => btn
 				.setButtonText('Check for Updates')
 				.onClick(async () => {
-					await this.plugin.checkForUpdates(false);
+					await this.plugin.checkForUpdates(false, true);
 				})
 			);
 
 		new Setting(containerEl)
 			.setName('Auto Check for Vault Updates')
-			.setDesc('Automatically check the GitHub repository for updates to the GATE vault when Obsidian starts.')
+			.setDesc(
+				this.plugin.gitHubService.isAuthenticated()
+					? 'Automatically check the GitHub repository for updates when Obsidian starts.'
+					: 'Automatically check the GitHub repository for updates when Obsidian starts. Requires a GitHub Access Token (see Advanced Settings below) — without one, please use the "Check for Updates" button above instead.'
+			)
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.autoCheckUpdates)
 				.onChange(async (value) => {
+					if (value && !this.plugin.gitHubService.isAuthenticated()) {
+						toggle.setValue(false);
+						this.plugin.showNotice('Add a GitHub Access Token in Advanced Settings first to enable automatic checks.');
+						return;
+					}
 					this.plugin.settings.autoCheckUpdates = value;
 					await this.plugin.saveSettings();
 				})
@@ -2843,7 +3940,7 @@ class GateManagerSettingTab extends PluginSettingTab {
 			.setDesc('Comma-separated list of paths/folders to uncheck by default during installation.')
 			.addTextArea(text => {
 				text
-					.setPlaceholder('e.g., SPEC.md, .obsidian/app.json, Resources')
+					.setPlaceholder('e.g., .obsidian, 11. ERROR Logbook, SPEC.md, etc.')
 					.setValue(this.plugin.settings.exclusionFilter)
 					.onChange(async (value) => {
 						this.plugin.settings.exclusionFilter = value;
@@ -2857,14 +3954,25 @@ class GateManagerSettingTab extends PluginSettingTab {
 				.setButtonText('Reset')
 				.setTooltip('Reset to Default Exclusions')
 				.onClick(async () => {
-					this.plugin.settings.exclusionFilter = ".obsidian/app.json, tools, .gitattributes, CODE_OF_CONDUCT.md, CONTRIBUTING.md, INDEX_SPEC.md, INSTALL_PLAN_SPEC.md, README.md, SPEC.md, UPDATE_POLICY.md, VAULT_RULES_SPEC.md, VAULT_SPEC.md, vault-index.json, vault-manifest.json, vault-rules.json";
+					this.plugin.settings.exclusionFilter = ".obsidian, scripts, tools, .gitattributes, CODE_OF_CONDUCT.md, CONTRIBUTING.md, INDEX_GENERATOR_SPEC.md, INDEX_SPEC.md, INSTALL_PLAN_SPEC.md, LICENSE, README.md, SPEC.md, UPDATE_POLICY.md, VAULT_RULES_SPEC.md, VAULT_SPEC.md, vault-index.json, vault-manifest.json, vault-rules.json";
 					await this.plugin.saveSettings();
-					this.display(); // Refresh UI
+					this.display(); 
 				})
 			);
 
 		// SECTION: Preferences
 		new Setting(containerEl).setHeading().setName('Preferences');
+
+		new Setting(containerEl)
+			.setName('Auto-open Changelog')
+			.setDesc('Automatically open the changelog file in a new tab after a successful installation.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.autoOpenChangelog)
+				.onChange(async (value) => {
+					this.plugin.settings.autoOpenChangelog = value;
+					await this.plugin.saveSettings();
+				})
+			);
 
 		new Setting(containerEl)
 			.setName('Open Vault After Installation')
@@ -2896,6 +4004,7 @@ class GateManagerSettingTab extends PluginSettingTab {
 			.setDesc('Open the main GATE Manager interface to install or update vaults.')
 			.addButton(btn => btn
 				.setButtonText('Open Manager')
+				.setCta()
 				.onClick(() => {
 					this.plugin.app.setting.close(); 
 					this.plugin.openManager();
@@ -2909,11 +4018,20 @@ class GateManagerSettingTab extends PluginSettingTab {
             .setName('Connect with us')
             .setDesc('Reach out via official channels for support, updates, and announcements.');
 
-        socialSetting.addButton(btn => {
-            btn.setButtonText('Join Broadcast Channel')
-                .setTooltip('Join our official Arattai channel')
+
+		socialSetting.addButton(btn => {
+            btn.setButtonText('Join Youtube Channel')
+                .setTooltip('Join our official Youtube channel for updates and support.')
                 .onClick(() => {
-                    window.open('https://aratt.ai/@gate', '_blank');
+                    window.open('https://www.youtube.com/@zettelforgate', '_blank');
+                });
+        });
+
+        socialSetting.addButton(btn => {
+            btn.setButtonText('Join Telegram Channel')
+                .setTooltip('Join our official Telegram channel for updates and support.')
+                .onClick(() => {
+                    window.open('https://t.me/gate_ee0', '_blank');
                 });
         });
 
@@ -2925,13 +4043,79 @@ class GateManagerSettingTab extends PluginSettingTab {
                 });
         });
 
-        socialSetting.addButton(btn => {
-            btn.setButtonText('Join Private Group Chat (only Supporters)')
-                .setTooltip('Join our private group')
-                .onClick(() => {
-                    window.open('https://chat.arattai.in/groups/r43545f313436363135373638323731353339343239325f333333363938382d47437c3031303032313133333230353137383335393037363537363530', '_blank');
-                });
-        });
+		// SECTION: Advanced Settings
+		new Setting(containerEl).setHeading().setName('Advanced Settings');
+
+		const storageNote = TokenCrypto.isAvailable()
+			? "🔒 Stored encrypted at rest using your operating system's secure storage (Keychain/DPAPI/libsecret) — the token itself is never written to disk in plain text."
+			: "⚠️ Stored in plain text in this vault's plugin data file (.obsidian/plugins/gate-manager/data.json). Your OS's secure storage isn't available on this platform/build, so this is the same as how Obsidian stores the rest of this plugin's settings — anyone with file access to your vault (or a backup/sync of it) could read this token from that file. Only paste in a token with the minimal 'public_repo' (read-only) scope, never one with broader permissions.";
+
+		const tokenStatusDesc = this.plugin.gitHubService.isAuthenticated()
+			? `✅ Token is set. Update checks now use your own higher limit and won't compete with other users on your network. ${storageNote}`
+			: `Optional, but recommended. Without a token, update checks use a small limit that is shared by everyone on your WiFi/network (e.g. school, office). With a token, checks use your own personal, much larger limit instead — and automatic checks on startup are enabled. ${storageNote}`;
+
+		new Setting(containerEl)
+			.setName('GitHub Access Token (optional)')
+			.setDesc(tokenStatusDesc)
+			.addText(text => {
+				text.inputEl.type = 'password';
+				text.inputEl.autocomplete = 'off';
+				text.inputEl.spellcheck = false;
+				text
+					.setPlaceholder('Paste your token here')
+					.setValue(this.plugin.settings.githubToken)
+					.onChange((value) => {
+						this.plugin.settings.githubToken = value.trim();
+					});
+
+				text.inputEl.addEventListener('blur', async () => {
+					this.plugin.settings.githubToken = text.inputEl.value.trim();
+					await this.plugin.saveSettings();
+					this.display(); // refresh so the description/status and auto-check toggle reflect the new state
+				});
+
+				return text;
+			})
+			.addExtraButton(btn => btn
+				.setIcon('eye')
+				.setTooltip('Show/hide token')
+				.onClick(() => {
+					// Only toggle the token field itself (first password-type input in this section)
+					const tokenInput = containerEl.querySelector('input[placeholder="Paste your token here"]');
+					if (tokenInput) {
+						tokenInput.type = tokenInput.type === 'password' ? 'text' : 'password';
+					}
+				})
+			);
+
+		const tokenHelp = containerEl.createEl('div', { cls: 'setting-item-description' });
+		tokenHelp.style.marginTop = '-8px';
+		tokenHelp.style.marginBottom = '12px';
+		tokenHelp.style.opacity = '0.8';
+		tokenHelp.innerHTML = `Don't have a token? It's free and takes about a minute:<br>
+			1. Go to <a href="https://github.com/settings/tokens/new?description=GATE%20Manager&scopes=public_repo" target="_blank">github.com/settings/tokens/new</a> (sign in to GitHub first)<br>
+			2. Leave the default options, scroll down, and click "Generate token"<br>
+			3. Copy the code shown (starts with "ghp_" or "github_pat_") and paste it above<br>
+			<em>This token only allows reading public repositories — it cannot access or change anything else in your GitHub account. See the storage note above for exactly how it's kept on this device.</em>`;
+
+		if (this.plugin.settings.githubToken) {
+			new Setting(containerEl)
+				.setName('Remove token')
+				.setDesc('Stop using a personal access token and fall back to the shared, unauthenticated limit.')
+				.addButton(btn => btn
+					.setButtonText('Remove')
+					.setWarning()
+					.onClick(async () => {
+						this.plugin.settings.githubToken = '';
+						if (this.plugin.settings.autoCheckUpdates) {
+							this.plugin.settings.autoCheckUpdates = false; // no longer eligible without a token
+							this.plugin.showNotice('Automatic update checks disabled (require a token).');
+						}
+						await this.plugin.saveSettings();
+						this.display();
+					})
+				);
+		}
 
 		// SECTION: Cache Management
 		new Setting(containerEl).setHeading().setName('Cache Management');
@@ -2942,10 +4126,37 @@ class GateManagerSettingTab extends PluginSettingTab {
             .addButton(button => button
                 .setButtonText('Clear Cache')
                 .setWarning()
-                .onClick(() => {
-                    this.plugin.tempManager.cleanAll();
+                .onClick(async () => {
+                    await this.plugin.tempManager.cleanAll();
                     new Notice("Cache cleared.");
                 }));
+
+		// ==========================================
+		// DEVELOPER MODE OPTIONS (Hidden by default)
+		// ==========================================
+		if (DEV_MODE) {
+			new Setting(containerEl).setHeading().setName('Developer Options (DEV_MODE)');
+			
+			new Setting(containerEl)
+				.setName('Force Target Version')
+				.setDesc('Force the plugin to download a specific release tag (e.g., v0.0.5) instead of the latest. Leave blank to use latest.')
+				.addText(text => {
+					text
+						.setPlaceholder('e.g., v0.0.5')
+						.setValue(this.plugin.settings.devTargetVersion)
+						.onChange((value) => {
+							this.plugin.settings.devTargetVersion = value.trim();
+						});
+
+					text.inputEl.addEventListener('blur', async () => {
+						this.plugin.settings.devTargetVersion = text.inputEl.value.trim();
+						await this.plugin.saveSettings();
+						new Notice("Target version forced. Check for updates to apply.");
+					});
+
+					return text;
+				});
+		}
 	}
 }
 
