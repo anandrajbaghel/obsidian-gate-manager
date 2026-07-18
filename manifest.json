@@ -1,7 +1,7 @@
 {
 	"id": "gate-manager",
 	"name": "GATE Manager",
-	"version": "1.0.1",
+	"version": "1.1.0",
 	"minAppVersion": "1.8.0",
 	"description": "Install and update community-maintained GATE Vault repositories.",
 	"author": "Anand Baghel",
