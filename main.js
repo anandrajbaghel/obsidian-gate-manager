@@ -1,3 +1,4 @@
+
 // ==========================================
 // DEVELOPER CONFIGURATION
 // ==========================================
@@ -132,6 +133,7 @@ const DEFAULT_SETTINGS = {
 	repositoryOwner: "anandrajbaghel",
 	repositoryName: "gate-vault",
 	autoCheckUpdates: false,
+	autoInstallOnIntegrityFailure: true,
 	openVaultAfterInstall: false,
 	enableNotifications: true,
 	releaseChannel: "stable",
@@ -2057,6 +2059,8 @@ class ExecutionResult {
 	constructor() {
 		this.success = false;
 		this.errors = [];
+		this.integrityWarnings = [];
+		this.failedIntegrityActions = [];
 		this.installedFilesCount = 0;
 	}
 }
@@ -2192,9 +2196,14 @@ class InstallationExecutor {
 					
 					const hash = await HashService.getFileHash(destPath);
 					if (action.repositoryHash && hash !== action.repositoryHash) {
-						this.result.errors.push(`Integrity verification failed for ${action.path} after copying. Skipping.`);
-						await revertFile(destPath); // don't leave the corrupted copy in the vault
-						continue; // Soft Fail: Skip to the next file
+						if (this.plugin.settings.autoInstallOnIntegrityFailure) {
+							this.result.integrityWarnings.push(action);
+						} else {
+							this.result.errors.push(`Integrity verification failed for ${action.path} after copying. Skipping.`);
+							this.result.failedIntegrityActions.push(action);
+							await revertFile(destPath); // don't leave the corrupted copy in the vault
+							continue; // Soft Fail: Skip to the next file
+						}
 					}
 					installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
 					installedCount++;
@@ -2225,9 +2234,14 @@ class InstallationExecutor {
 
 						const hash = await HashService.getFileHash(destPath);
 						if (action.repositoryHash && hash !== action.repositoryHash) {
-							this.result.errors.push(`Integrity verification failed for ${action.path} after merge. Skipping.`);
-							await revertFile(destPath); // don't leave the corrupted copy in the vault
-							continue;
+							if (this.plugin.settings.autoInstallOnIntegrityFailure) {
+								this.result.integrityWarnings.push(action);
+							} else {
+								this.result.errors.push(`Integrity verification failed for ${action.path} after merge. Skipping.`);
+								this.result.failedIntegrityActions.push(action);
+								await revertFile(destPath); // don't leave the corrupted copy in the vault
+								continue;
+							}
 						}
 						installedFilesList.push({ path: action.path, installedHash: hash, installDate: Date.now() });
 						installedCount++;
@@ -2292,7 +2306,11 @@ class InstallationExecutor {
 			this.result.installedFilesCount = installedCount;
 			this.state = 'completed';
 			
-			await this.plugin.tempManager.cleanAll();
+			if (this.result.failedIntegrityActions && this.result.failedIntegrityActions.length > 0) {
+				// Retain cache so the user can optionally force-install the skipped files
+			} else {
+				await this.plugin.tempManager.cleanAll();
+			}
 
 		} catch (error) {
 			// Trigger rollback on any file I/O or validation failure
@@ -2318,6 +2336,104 @@ class InstallationExecutor {
 			this.state = 'failed';
 			this.result.success = false;
 			this.result.errors.push(error.message || "Installation failed and was safely rolled back.");
+		}
+		
+		this.plugin.notifyUI();
+	}
+
+	async forceInstallActions(actions) {
+		this.resetState();
+		this.state = 'executing';
+		this.plugin.statusBarItemEl.setText("🔄 GATE: Force Installing...");
+		this.plugin.notifyUI();
+
+		this.result = new ExecutionResult();
+
+		if (!this.plugin.stateLoader || !this.plugin.stateLoader.model) {
+			this.state = 'failed';
+			this.result.success = false;
+			this.result.errors.push("Installation aborted: plugin state has not finished loading yet.");
+			this.plugin.notifyUI();
+			return;
+		}
+
+		const vaultRoot = this.plugin.app.vault.adapter.getBasePath();
+		const archiveRoot = this.plugin.extractionManager.result.archiveRoot;
+		
+		this.progress.total = actions.length;
+		const currentState = this.plugin.stateLoader.model || {};
+		const existingInstalled = Array.isArray(currentState.installedFiles) ? [...currentState.installedFiles] : [];
+		let installedCount = 0;
+
+		try {
+			for (const action of actions) {
+				const destPath = path.join(vaultRoot, action.path);
+				const srcPath = path.join(archiveRoot, action.path);
+
+				const destDir = path.dirname(destPath);
+				await fs.promises.mkdir(destDir, { recursive: true });
+
+				if (!fs.existsSync(srcPath)) {
+					this.result.errors.push(`Skipped ${action.path}: Incoming file missing.`);
+					this.progress.current++;
+					continue;
+				}
+				
+				await fs.promises.stat(srcPath);
+				await fs.promises.copyFile(srcPath, destPath);
+				
+				const hash = await HashService.getFileHash(destPath);
+				
+				// Update or add the entry with the new verified-but-forced hash
+				const existingIndex = existingInstalled.findIndex(f => f.path === action.path);
+				const entry = { path: action.path, installedHash: hash, installDate: Date.now() };
+				if (existingIndex >= 0) {
+					existingInstalled[existingIndex] = entry;
+				} else {
+					existingInstalled.push(entry);
+				}
+				
+				installedCount++;
+				this.progress.current++;
+				
+				if (this.progress.current % 5 === 0) {
+					this.plugin.statusBarItemEl.setText(`🔄 GATE: Installing ${this.progress.current}/${this.progress.total}`);
+					this.plugin.notifyUI();
+				}
+			}
+			
+			const history = Object.assign({}, currentState.history || {});
+			history.lastInstall = Date.now();
+			history.lastUpdate = Date.now();
+
+			const stats = Object.assign({}, currentState.statistics || {});
+			stats.installedFiles = existingInstalled.length;
+
+			const newState = {
+				stateVersion: 1,
+				pluginVersion: this.plugin.manifest.version,
+				installedRepository: currentState.installedRepository,
+				installedVersion: currentState.installedVersion,
+				installationType: currentState.installationType,
+				installedFiles: existingInstalled,
+				installationDate: currentState.installationDate || Date.now(),
+				lastUpdate: Date.now(),
+				history: history,
+				statistics: stats
+			};
+			
+			await this.plugin.saveState(newState);
+			
+			this.result.success = true;
+			this.result.installedFilesCount = installedCount;
+			this.state = 'completed';
+			
+			await this.plugin.tempManager.cleanAll();
+
+		} catch (error) {
+			this.state = 'failed';
+			this.result.success = false;
+			this.result.errors.push(error.message || "Force installation failed.");
 		}
 		
 		this.plugin.notifyUI();
@@ -2699,6 +2815,83 @@ class InstallPlanReviewModal extends Modal {
 	}
 }
 
+class IntegrityFailureModal extends Modal {
+	constructor(app, plugin, failedActions, onConfirm) {
+		super(app);
+		this.plugin = plugin;
+		this.failedActions = failedActions;
+		this.onConfirm = onConfirm;
+		this.selectedActionIds = new Set();
+		this.checkboxMap = new Map();
+
+		for (const a of failedActions) {
+			this.selectedActionIds.add(a.id);
+		}
+	}
+
+	onOpen() {
+		const { contentEl, titleEl } = this;
+		titleEl.setText('Force Install Files');
+		
+		contentEl.createEl('p', { text: 'The following files failed the integrity check (checksum mismatch). This is often due to harmless line-ending conversions in text files, but could indicate corruption.' });
+
+		const controlsDiv = contentEl.createDiv({ attr: { style: 'display: flex; gap: 20px; align-items: center; margin-bottom: 15px;' } });
+
+		const selectAllDiv = controlsDiv.createDiv({ attr: { style: 'display: flex; align-items: center; gap: 8px;' } });
+		selectAllDiv.createEl('span', { text: 'Select All', cls: 'text-muted', attr: { style: 'font-size: 0.9em; user-select: none;' } });
+		new ToggleComponent(selectAllDiv)
+			.setValue(true) 
+			.onChange((value) => {
+				this.failedActions.forEach(a => {
+					if (value) this.selectedActionIds.add(a.id);
+					else this.selectedActionIds.delete(a.id);
+					
+					const cb = this.checkboxMap.get(a.id);
+					if (cb) cb.checked = value;
+				});
+			});
+
+		const container = contentEl.createDiv({ attr: { style: 'max-height: 60vh; overflow-y: auto; background: var(--background-secondary); padding: 15px; border-radius: 5px; margin-bottom: 15px; border: 1px solid var(--background-modifier-border);' } });
+		
+		for (const a of this.failedActions) {
+			const row = container.createDiv({ attr: { style: 'display: flex; align-items: center; padding: 4px 0;' } });
+			const cb = row.createEl('input', { type: 'checkbox', attr: { style: 'margin-right: 8px;' } });
+			cb.checked = true;
+			this.checkboxMap.set(a.id, cb);
+
+			const label = row.createEl('span', { attr: { style: 'font-family: var(--font-monospace); cursor: pointer; color: var(--text-error);' } });
+			label.innerHTML = `📄 ${a.path}`;
+			
+			cb.onchange = () => {
+				if (cb.checked) this.selectedActionIds.add(a.id);
+				else this.selectedActionIds.delete(a.id);
+			};
+			label.onclick = () => {
+				cb.checked = !cb.checked;
+				cb.onchange();
+			};
+		}
+		
+		const btnContainer = contentEl.createDiv({ attr: { style: 'display: flex; justify-content: flex-end; gap: 10px;' } });
+		
+		const cancelBtn = btnContainer.createEl('button', { text: 'Cancel' });
+		cancelBtn.onclick = () => {
+			this.close();
+		};
+		
+		const confirmBtn = btnContainer.createEl('button', { text: 'Install Selected', cls: 'mod-cta' });
+		confirmBtn.onclick = () => {
+			const selectedActions = this.failedActions.filter(a => this.selectedActionIds.has(a.id));
+			this.onConfirm(selectedActions);
+			this.close();
+		};
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 class OnboardingModal extends Modal {
 	constructor(app, plugin) {
 		super(app);
@@ -2840,8 +3033,14 @@ class GateManagerView extends ItemView {
 							 exec.state === 'executing';
 		
 		if (isProcessing) {
-			this.updateProgressUI();
+			if (!this.progressUI) {
+				this.actionsContainerEl.empty();
+				this.renderProgressPanel();
+			} else {
+				this.updateProgressUI();
+			}
 		} else {
+			this.progressUI = null;
 			this.renderActionsContainer();
 		}
 	}
@@ -3099,6 +3298,11 @@ class GateManagerView extends ItemView {
 		if (result.success) {
 			summary.append(createEl("span", { text: `Successfully installed/updated ${result.installedFilesCount} files.`, cls: 'gate-manager-success-text' }), createEl("br"));
 			
+			if (result.integrityWarnings && result.integrityWarnings.length > 0) {
+				summary.append(createEl("br"));
+				summary.append(createEl("span", { text: `ℹ️ ${result.integrityWarnings.length} file(s) installed despite a checksum mismatch (likely line-ending differences, not corruption).`, attr: { style: 'color: var(--text-accent); font-size: 0.9em;' } }), createEl("br"));
+			}
+
 			// If the installation succeeded but files were skipped (Soft Fail)
 			if (result.errors && result.errors.length > 0) {
 				summary.append(createEl("br"));
@@ -3110,7 +3314,18 @@ class GateManagerView extends ItemView {
 		
 		setting.setDesc(summary);
 
-		setting.addButton(btn => btn.setButtonText('Dismiss').setCta().onClick(() => {
+		if (result.failedIntegrityActions && result.failedIntegrityActions.length > 0) {
+			setting.addButton(btn => btn.setButtonText('Install anyway').onClick(() => {
+				new IntegrityFailureModal(this.app, this.plugin, result.failedIntegrityActions, async (selectedActions) => {
+					if (selectedActions.length > 0) {
+						await this.plugin.installationExecutor.forceInstallActions(selectedActions);
+					}
+				}).open();
+			}));
+		}
+
+		setting.addButton(btn => btn.setButtonText('Dismiss').setCta().onClick(async () => {
+			await this.plugin.tempManager.cleanAll();
 			this.plugin.resetAllManagers();
 			this.plugin.notifyUI();
 		}));
@@ -3128,7 +3343,8 @@ class GateManagerView extends ItemView {
 		
 		setting.setDesc(summary);
 
-		setting.addButton(btn => btn.setButtonText('Dismiss').onClick(() => {
+		setting.addButton(btn => btn.setButtonText('Dismiss').onClick(async () => {
+			await this.plugin.tempManager.cleanAll();
 			this.plugin.resetAllManagers();
 			this.plugin.notifyUI();
 		}));
@@ -3962,6 +4178,17 @@ class GateManagerSettingTab extends PluginSettingTab {
 
 		// SECTION: Preferences
 		new Setting(containerEl).setHeading().setName('Preferences');
+
+		new Setting(containerEl)
+			.setName('Auto-install files that fail integrity check')
+			.setDesc('Recommended: keep this on. Some files (especially text files) can fail the checksum check due to line-ending differences rather than actual corruption. When enabled, these files are installed anyway. When disabled, you\'ll be able to choose which ones to force-install after each run.')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.autoInstallOnIntegrityFailure)
+				.onChange(async (value) => {
+					this.plugin.settings.autoInstallOnIntegrityFailure = value;
+					await this.plugin.saveSettings();
+				})
+			);
 
 		new Setting(containerEl)
 			.setName('Auto-open Changelog')
