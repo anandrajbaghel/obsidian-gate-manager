@@ -1,3 +1,14 @@
+Message for `GATE Simulator Plugin` users
+
+These folders are must to download for working of `GATE Simulator Plugin`
+
+1. `Resources/Question Paper`,
+2. `Resources/Image/Question Paper`, and
+3. `12. PYQs Pattern Book`
+
+==Keep them up to date, as incorrect questions and answer keys are regularly corrected and improved.==
+
+
 # 🎓 GATE Manager
 
 **Keep your GATE study vault up to date without losing your personal notes.**
@@ -11,7 +22,6 @@ GATE Manager connects your personal vault with a community-maintained GATE repos
 
 - Download GATE Vault releases directly from GitHub.
 - Install and update repository files in your vault.
-- Display release notes before installation.
 - Preview every installation action before making changes.
 - Preserve user-owned files according to repository rules.
 - Help keep your study material synchronized with the latest community release.
@@ -20,22 +30,22 @@ GATE Manager connects your personal vault with a community-maintained GATE repos
 
 ## 📸 Screenshots
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e47a57e1-a809-4df2-b7c1-8205483ae30c" />
+<img width="1173" height="586" alt="image" src="https://github.com/user-attachments/assets/c2ccc865-3526-496f-aefb-245e726444ba" />
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/993fc63e-ee59-42e1-8d64-82547889e5dc" />
+<img width="976" height="834" alt="image" src="https://github.com/user-attachments/assets/8d1404a3-329f-4cc8-8f98-60594f4054d5" />
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/84bea706-5355-456a-aaea-4a3409f7847b" />
+<img width="997" height="504" alt="image" src="https://github.com/user-attachments/assets/d72aad2a-a28c-4aa0-8e0b-8c8eb1e356ab" />
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/0a20f4b3-54fa-444e-b99c-dfaf12b6d0aa" />
+<img width="965" height="485" alt="image" src="https://github.com/user-attachments/assets/f3774f3b-773f-4689-9795-c62ff102ec70" />
 
 ---
 
 ## ✅ Compatibility
 
+- ✅ Mobile
 - ✅ Windows
 - ✅ macOS
 - ✅ Linux
-- ❌ Mobile (currently not supported)
 
 ---
 
@@ -91,28 +101,6 @@ GATE Manager:
 - Does **not** track user activity.
 - Does **not** upload vault contents.
 - Does **not** require an account.
-
----
-
-## ❓ Frequently Asked Questions
-
-### Does GATE Manager overwrite my personal notes?
-
-No.
-
-Before any changes are made, GATE Manager generates an installation plan that you can review. Only approved actions are performed.
-
-### Does it require GitHub?
-
-Yes.
-
-Repository releases are downloaded from GitHub.
-
-### Can I see what will change before installing?
-
-Yes.
-
-Every installation or update displays a detailed installation plan so you can review the proposed changes before confirming.
 
 ---
 
